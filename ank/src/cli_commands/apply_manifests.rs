@@ -552,7 +552,8 @@ mod tests {
         let mut new_workload = workload.clone();
         new_workload.workload.agent = overwritten_agent_name.to_owned();
         new_workload.instance_name.agent_name = overwritten_agent_name.to_owned();
-        let expected_state = generate_test_state_from_workloads(vec![new_workload]).into();
+        let expected_state_spec = generate_test_state_from_workloads(vec![new_workload]);
+        let expected_state: Object = expected_state_spec.try_into().unwrap();
 
         assert_eq!(
             handle_agent_overwrite(
@@ -561,7 +562,7 @@ mod tests {
                 state.try_into().unwrap(),
             )
             .unwrap(),
-            expected_state
+            expected_state.try_into().unwrap()
         );
     }
 
@@ -570,6 +571,8 @@ mod tests {
     fn utest_handle_agent_overwrite_one_agent_name_provided_in_workloads() {
         let state = generate_test_state_from_workloads(vec![generate_test_workload_named()]);
 
+        let expected_state: Object = state.clone().try_into().unwrap();
+
         assert_eq!(
             handle_agent_overwrite(
                 &vec![format!("workloads.{}", fixtures::WORKLOAD_NAMES[0]).into()],
@@ -577,7 +580,7 @@ mod tests {
                 state.clone().try_into().unwrap(),
             )
             .unwrap(),
-            state.into()
+            expected_state.try_into().unwrap()
         );
     }
 
@@ -597,6 +600,8 @@ mod tests {
             ),
         ]);
 
+        let expected_state: Object = state.clone().try_into().unwrap();
+
         assert_eq!(
             handle_agent_overwrite(
                 &vec![
@@ -607,7 +612,7 @@ mod tests {
                 state.clone().try_into().unwrap(),
             )
             .unwrap(),
-            state.into()
+            expected_state.try_into().unwrap()
         );
     }
 
@@ -637,12 +642,13 @@ mod tests {
     fn utest_handle_agent_overwrite_missing_agent_name() {
         let state = generate_test_state_from_workloads(vec![generate_test_workload_named()]);
 
-        let expected_state = generate_test_state_from_workloads(vec![{
+        let expected_state_spec = generate_test_state_from_workloads(vec![{
             let mut workload = generate_test_workload_named();
             workload.workload.agent = "overwritten_agent_name".to_string();
             workload.instance_name.agent_name = "overwritten_agent_name".to_string();
             workload
         }]);
+        let expected_state: Object = expected_state_spec.try_into().unwrap();
 
         let mut obj: Object = state.try_into().unwrap();
 
@@ -656,7 +662,7 @@ mod tests {
                 obj,
             )
             .unwrap(),
-            expected_state.into()
+            expected_state.try_into().unwrap()
         );
     }
 
@@ -665,6 +671,7 @@ mod tests {
     fn utest_handle_agent_overwrite_considers_only_workloads() {
         let state = generate_test_state_from_workloads(vec![generate_test_workload_named()]);
         let expected_state = state.clone();
+        let expected_state_obj: Object = expected_state.try_into().unwrap();
 
         let cli_specified_agent_name = None;
 
@@ -678,7 +685,7 @@ mod tests {
                 state.try_into().unwrap(),
             )
             .unwrap(),
-            expected_state.into()
+            expected_state_obj.try_into().unwrap()
         );
     }
 

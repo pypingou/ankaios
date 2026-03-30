@@ -409,6 +409,7 @@ pub fn generate_test_workload_with_runtime_config(
         configs: generate_test_config_mappings(),
         control_interface_access: generate_test_control_interface_access(),
         files: generate_test_files(),
+        persist: false,
     }
 }
 

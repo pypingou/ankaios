@@ -29,12 +29,14 @@ impl CliCommands {
         runtime_config: String,
         agent_name: String,
         tags: HashMap<String, String>,
+        persist: bool,
     ) -> Result<(), CliError> {
         let new_workload = Workload {
             agent: Some(agent_name),
             runtime: Some(runtime_name),
             tags: Some(Tags { tags }),
             runtime_config: Some(runtime_config),
+            persist: Some(persist),
             ..Default::default()
         };
         output_debug!("Request to run new workload: {:?}", new_workload);
@@ -101,6 +103,7 @@ mod tests {
                 tags: HashMap::from([("key".to_string(), "value".to_string())]),
             }),
             runtime_config: Some(test_workload_runtime_cfg.clone()),
+            persist: Some(false),
             ..Default::default()
         };
         let complete_state_update = CompleteState {
@@ -179,6 +182,7 @@ mod tests {
                 test_workload_runtime_cfg,
                 fixtures::AGENT_NAMES[0].to_owned(),
                 HashMap::from([("key".to_string(), "value".to_string())]),
+                false,
             )
             .await;
         assert!(run_workload_result.is_ok());

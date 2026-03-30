@@ -207,6 +207,214 @@ Needs:
 - utest
 - stest
 
+### Runtime State Persistence
+
+#### Server extracts persistent workloads
+`swdd~server-extracts-persistent-workloads~1`
+
+Status: approved
+
+The Ankaios server shall provide a method to extract only workloads marked with `persist: true` from a complete state specification. This filtering operation:
+- Shall include all workloads where the `persist` field is set to `true`
+- Shall exclude all workloads where the `persist` field is `false` or unset
+- Shall always include all configuration items (configs are not filtered)
+- Shall preserve the API version from the original state
+
+Rationale: Selective persistence allows infrastructure workloads to survive restarts while keeping debug/test workloads ephemeral.
+
+Tags:
+- AnkaiosServer
+
+Needs:
+- impl
+- utest
+
+#### Server persists state atomically
+`swdd~server-persists-state-atomically~1`
+
+Status: approved
+
+The Ankaios server shall persist the filtered state to a YAML file using atomic write operations. The persistence operation:
+- Shall write to a temporary file first (with .tmp extension)
+- Shall create a backup of the existing file (with .backup extension) before overwriting
+- Shall use atomic rename to replace the old file with the new one
+- Shall create parent directories if they don't exist
+- Shall delete the persistence file when no persistent workloads exist
+- Shall handle errors gracefully without failing the state update
+
+Rationale: Atomic writes prevent file corruption during power loss or system crashes. Backup creation provides recovery options.
+
+Tags:
+- AnkaiosServer
+
+Needs:
+- impl
+- utest
+
+#### Server persists state after update
+`swdd~server-persists-state-after-update~1`
+
+Status: approved
+
+The Ankaios server shall automatically persist the current state to the configured persistence file after every successful UpdateStateRequest. The persistence:
+- Shall occur after the in-memory state update succeeds
+- Shall occur before sending the UpdateStateSuccess response to the client
+- Shall log errors but not fail the state update (best-effort)
+- Shall only persist if state_persistence_file is configured
+
+Rationale: Automatic persistence ensures users don't need to manually save state. Best-effort approach prevents persistence issues from affecting system availability.
+
+Tags:
+- AnkaiosServer
+
+Needs:
+- impl
+- utest
+
+#### Server loads runtime state at startup
+`swdd~server-loads-runtime-state-at-startup~1`
+
+Status: approved
+
+The Ankaios server shall load and merge the runtime state file at startup. The loading process:
+- Shall load the startup manifest first (if configured)
+- Shall load the runtime state file second (if configured and exists)
+- Shall merge runtime state over startup state (runtime values override startup values)
+- Shall log warnings for missing or corrupted runtime state files without failing startup
+- Shall continue startup with only the startup manifest if runtime state cannot be loaded
+
+Rationale: Merging allows both static (startup manifest) and dynamic (runtime state) configuration. Graceful degradation ensures system availability even with persistence file issues.
+
+Tags:
+- AnkaiosServer
+- StartupStateLoader
+
+Needs:
+- impl
+- utest
+
+#### Overview
+Ankaios supports persisting workloads across server restarts. Workloads marked with
+`persist: true` are saved to a separate runtime state file on every state update.
+
+#### Architecture
+
+**File Structure:**
+- Startup manifest: `/etc/ankaios/startup.yaml` (never modified, base configuration)
+- Runtime state: `/var/lib/ankaios/runtime_state.yaml` (auto-managed, persisted workloads)
+- Backup: `/var/lib/ankaios/runtime_state.backup` (safety backup before each write)
+
+**Startup Flow:**
+1. Load startup manifest (base configuration)
+2. Load runtime state file (persisted workloads)
+3. Merge: runtime overrides startup
+4. Start server with merged state
+
+**Runtime Flow:**
+1. Receive UpdateStateRequest
+2. Update in-memory state
+3. Extract workloads with persist=true
+4. Atomically write to runtime_state.yaml
+5. Send response to client
+
+#### Persistence Semantics
+
+**Per-Workload Control:**
+- Workloads with `persist: true` are saved to runtime_state.yaml
+- Workloads with `persist: false` (default) are ephemeral
+- All configs are persisted (no per-config control)
+
+**Atomic Writes:**
+- Write to temporary file (.tmp extension)
+- Rename atomically (prevents corruption)
+- Create backup before overwriting
+- Create parent directories if needed
+
+**Empty State Handling:**
+- When no persistent workloads exist, runtime_state.yaml is deleted
+- Prevents accumulation of empty state files
+
+**Error Handling:**
+- Persistence errors are logged but don't fail state updates
+- Invalid runtime state at startup → warning logged, startup manifest used
+- Missing runtime state → no warning, normal startup with startup manifest only
+
+#### Implementation Details
+
+**`extract_persistent_workloads()` - Filtering Logic:**
+```rust
+fn extract_persistent_workloads(state: &StateSpec) -> StateSpec {
+    // Filter workloads where persist == true
+    // Always include all configs
+    // Return new StateSpec with only persistent items
+}
+```
+
+**`persist_state_to_file()` - Atomic Persistence:**
+```rust
+async fn persist_state_to_file(&self, state: &StateSpec) -> Result<(), String> {
+    // 1. Check if persistence is configured
+    // 2. Extract persistent workloads
+    // 3. Handle empty state (delete file)
+    // 4. Serialize to YAML
+    // 5. Create parent directories
+    // 6. Write to temp file
+    // 7. Create backup
+    // 8. Atomic rename
+}
+```
+
+**Startup State Loading:**
+- Occurs in `main.rs` after loading startup manifest
+- Merges runtime state over startup state (runtime wins)
+- Gracefully handles missing/corrupted files
+
+#### Use Cases
+
+**Persistent (Infrastructure):**
+- System monitoring containers
+- Database containers
+- Long-running services
+- Core system workloads
+
+**Temporary (Ephemeral):**
+- Debug/troubleshooting containers
+- Test workloads
+- Development tools
+- One-time tasks
+
+#### Configuration
+
+**Server Config (`/etc/ankaios/ank-server.conf`):**
+```toml
+version = "v1"
+startup_manifest = "/etc/ankaios/startup.yaml"
+state_persistence_file = "/var/lib/ankaios/runtime_state.yaml"
+```
+
+**YAML Manifest:**
+```yaml
+apiVersion: v0.1
+workloads:
+  nginx:
+    runtime: podman
+    agent: agent_A
+    runtimeConfig: "nginx:latest"
+    persist: true  # Survives restart
+```
+
+#### Traceability
+
+Implementation tags used:
+- `[impl->swdd~server-extracts-persistent-workloads~1]`
+- `[impl->swdd~server-persists-state-atomically~1]`
+- `[impl->swdd~server-persists-state-after-update~1]`
+- `[impl->swdd~server-loads-runtime-state-at-startup~1]`
+
+Test tags used:
+- `[utest->swdd~server-extracts-persistent-workloads~1]`
+- `[utest->swdd~server-persists-state-atomically~1]`
+
 #### StartupStateLoader parses yaml with Startup State
 `swdd~stored-workload-spec-parses-yaml~1`
 

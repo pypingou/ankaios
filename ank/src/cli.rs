@@ -369,6 +369,9 @@ pub enum RunCommands {
         ///Tags formatted as: "--tags key1=value1 --tags key2=value2"
         #[arg(long = "tags", value_parser = parse_key_val::<String, String>)]
         tags: Vec<(String, String)>,
+        /// Persist this workload to runtime state file (survives server restart)
+        #[arg(long = "persist")]
+        persist: bool,
     },
 }
 

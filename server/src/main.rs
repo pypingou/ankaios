@@ -27,6 +27,7 @@ use grpc::{security::TLSConfig, server::GRPCCommunicationsServer};
 use server_config::{DEFAULT_SERVER_CONFIG_FILE_PATH, ServerConfig};
 
 use std::fs;
+use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 pub mod test_helper;
@@ -79,7 +80,7 @@ async fn main() {
             .unwrap_or("[no manifest file provided]".to_string()),
     );
 
-    let startup_state = match &server_config.startup_manifest {
+    let mut startup_state = match &server_config.startup_manifest {
         Some(config_path) => {
             let data =
                 fs::read_to_string(config_path).unwrap_or_exit("Could not read the startup config");
@@ -103,6 +104,59 @@ async fn main() {
         // [impl->swdd~server-starts-without-startup-config~1]
         _ => None,
     };
+
+    // [impl->swdd~server-loads-runtime-state-at-startup~1]
+    // Load and merge runtime state
+    if let Some(persistence_path) = &server_config.state_persistence_file {
+        let path = Path::new(persistence_path);
+        if path.exists() {
+            log::info!("Loading persisted runtime state from {}", persistence_path);
+            match fs::read_to_string(path) {
+                Ok(data) => {
+                    match serde_yaml::from_str::<StateSpec>(&data) {
+                        Ok(runtime_state) => {
+                            let workload_count = runtime_state.workloads.workloads.len();
+                            log::info!("Found {} persisted workload(s)", workload_count);
+
+                            // Merge runtime state into complete state
+                            if let Some(ref mut state) = startup_state {
+                                // Runtime state overrides startup manifest
+                                for (name, workload) in runtime_state.workloads.workloads {
+                                    log::debug!("Restoring persistent workload: '{}'", name);
+                                    state.desired_state.workloads.workloads
+                                        .insert(name, workload);
+                                }
+
+                                // Merge configs too
+                                for (name, config) in runtime_state.configs.configs {
+                                    log::debug!("Restoring persistent config: '{}'", name);
+                                    state.desired_state.configs.configs
+                                        .insert(name, config);
+                                }
+                            } else {
+                                // No startup manifest, use runtime state as base
+                                log::info!("No startup manifest, using runtime state as base");
+                                startup_state = Some(CompleteStateSpec {
+                                    desired_state: runtime_state,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to parse runtime state file: {}", e);
+                            log::warn!("Continuing with startup state only");
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to read runtime state file: {}", e);
+                    log::warn!("Continuing with startup state only");
+                }
+            }
+        } else {
+            log::debug!("No runtime state file found at {}", persistence_path);
+        }
+    }
 
     let (to_server, server_receiver) = create_to_server_channel(common::CHANNEL_CAPACITY);
     let (to_agents, agents_receiver) = create_from_server_channel(common::CHANNEL_CAPACITY);
@@ -131,7 +185,22 @@ async fn main() {
         // [impl->swdd~server-fails-on-missing-file-paths-and-insecure-cli-arguments~1]
         tls_config.unwrap_or_exit("Missing certificate files"),
     );
-    let mut server = AnkaiosServer::new(server_receiver, to_agents.clone());
+
+    let persistence_file = server_config.state_persistence_file
+        .as_ref()
+        .map(PathBuf::from);
+
+    if let Some(ref path) = persistence_file {
+        log::info!("Workload state persistence enabled: {:?}", path);
+    } else {
+        log::info!("Workload state persistence disabled (no state_persistence_file configured)");
+    }
+
+    let mut server = AnkaiosServer::new(
+        server_receiver,
+        to_agents.clone(),
+        persistence_file,
+    );
 
     tokio::select! {
         // [impl->swdd~server-default-communication-grpc~1]

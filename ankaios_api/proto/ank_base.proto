@@ -392,6 +392,7 @@ message Workload {
     ControlInterfaceAccess controlInterfaceAccess = 7; // The authorization rules for accessing the control interface.
     ConfigMappings configs = 8; // A mapping containing the configurations assigned to the workload.
     Files files = 9; // A list of files assigned to the workload.
+    optional bool persist = 10;  // If true, this workload will be persisted to runtime state file across server restarts
 }
 
 /*

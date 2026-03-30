@@ -222,6 +222,7 @@ async fn main() {
                 runtime_config,
                 agent_name,
                 tags,
+                persist,
             }) => {
                 output_debug!(
                     "Received run workload with workload_name='{:?}', runtime='{:?}', runtime_config='{:?}', agent_name='{:?}', tags='{:?}'",
@@ -238,6 +239,7 @@ async fn main() {
                         runtime_config,
                         agent_name,
                         tags.into_iter().collect(),
+                        persist,
                     )
                     .await
                 {

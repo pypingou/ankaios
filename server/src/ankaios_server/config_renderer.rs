@@ -158,6 +158,7 @@ impl ConfigRenderer {
                 files: rendered_files,
                 configs: Default::default(),
                 control_interface_access: workload.control_interface_access.clone(),
+                persist: workload.persist,
             },
         })
     }

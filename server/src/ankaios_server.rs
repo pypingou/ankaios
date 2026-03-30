@@ -25,7 +25,8 @@ mod state_comparator;
 use ankaios_api::ank_base::{
     AgentAttributesSpec, AgentMapSpec, AgentStatusSpec, CompleteState, CompleteStateSpec,
     DeletedWorkload, ExecutionStateSpec, LogsStopResponse, Request, RequestContent,
-    WorkloadInstanceName, WorkloadInstanceNameSpec, WorkloadStateSpec, WorkloadStatesMapSpec,
+    StateSpec, WorkloadInstanceName, WorkloadInstanceNameSpec, WorkloadMapSpec,
+    WorkloadStateSpec, WorkloadStatesMapSpec,
 };
 use common::state_manipulation::Path;
 
@@ -62,7 +63,8 @@ use log_campaign_store::LogCampaignStore;
 
 use log_campaign_store::LogCollectorRequestId;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use crate::ankaios_server::server_state::StateGenerationResult;
 
@@ -76,10 +78,15 @@ pub struct AnkaiosServer {
     agent_map: AgentMapSpec,
     log_campaign_store: LogCampaignStore,
     event_handler: EventHandler,
+    persistence_file: Option<PathBuf>,
 }
 
 impl AnkaiosServer {
-    pub fn new(receiver: ToServerReceiver, to_agents: FromServerSender) -> Self {
+    pub fn new(
+        receiver: ToServerReceiver,
+        to_agents: FromServerSender,
+        persistence_file: Option<PathBuf>,
+    ) -> Self {
         AnkaiosServer {
             receiver,
             to_agents,
@@ -88,6 +95,7 @@ impl AnkaiosServer {
             agent_map: AgentMapSpec::default(),
             log_campaign_store: LogCampaignStore::default(),
             event_handler: EventHandler::default(),
+            persistence_file,
         }
     }
 
@@ -748,6 +756,14 @@ impl AnkaiosServer {
             .handle_not_started_deleted_workloads(deleted_workloads)
             .await;
 
+        // [impl->swdd~server-persists-state-after-update~1]
+        // Persist state after successful update (before moving new_desired_state)
+        if let Err(e) = self.persist_state_to_file(&state_generation_result.new_desired_state).await {
+            log::error!("Failed to persist state: {}", e);
+            // Don't fail the update - persistence is best-effort
+            // The update already succeeded in memory
+        }
+
         if self.event_handler.has_subscribers() {
             // [impl->swdd~server-sends-state-differences-as-events~1]
             let new_state = CompleteStateSpec {
@@ -891,6 +907,96 @@ impl AnkaiosServer {
             }
         }
     }
+
+    // [impl->swdd~server-extracts-persistent-workloads~1]
+    fn extract_persistent_workloads(state: &StateSpec) -> StateSpec {
+        let mut persistent_state = StateSpec {
+            api_version: state.api_version.clone(),
+            workloads: WorkloadMapSpec {
+                workloads: HashMap::new(),
+            },
+            configs: state.configs.clone(), // All configs are always persisted
+        };
+
+        // Filter workloads with persist = true
+        for (name, workload) in &state.workloads.workloads {
+            if workload.persist {
+                log::debug!("Workload '{}' marked for persistence", name);
+                persistent_state.workloads.workloads
+                    .insert(name.clone(), workload.clone());
+            } else {
+                log::trace!("Workload '{}' not marked for persistence", name);
+            }
+        }
+
+        persistent_state
+    }
+
+    // [impl->swdd~server-persists-state-atomically~1]
+    async fn persist_state_to_file(&self, state: &StateSpec) -> Result<(), String> {
+        let persistent_state = Self::extract_persistent_workloads(state);
+        let persistent_count = persistent_state.workloads.workloads.len();
+
+        let Some(path) = &self.persistence_file else {
+            if persistent_count > 0 {
+                log::warn!(
+                    "{} workload(s) have persist=true but no state_persistence_file is configured - persistence disabled",
+                    persistent_count
+                );
+            }
+            return Ok(());
+        };
+
+        // If no persistent workloads, remove the persistence file
+        if persistent_state.workloads.workloads.is_empty() {
+            log::debug!("No persistent workloads to save");
+
+            if path.exists() {
+                log::info!("Removing empty persistence file: {:?}", path);
+                tokio::fs::remove_file(path).await
+                    .map_err(|e| format!("Failed to remove persistence file: {}", e))?;
+            }
+            return Ok(());
+        }
+
+        log::info!(
+            "Persisting {} workload(s) to {:?}",
+            persistent_state.workloads.workloads.len(),
+            path
+        );
+
+        // Serialize to YAML
+        let yaml_content = serde_yaml::to_string(&persistent_state)
+            .map_err(|e| format!("Failed to serialize state: {}", e))?;
+
+        // Create parent directory if needed
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await
+                .map_err(|e| format!("Failed to create directory {:?}: {}", parent, e))?;
+        }
+
+        // Atomic write pattern: write to temp file, then rename
+        let temp_path = path.with_extension("tmp");
+        tokio::fs::write(&temp_path, &yaml_content).await
+            .map_err(|e| format!("Failed to write temp file {:?}: {}", temp_path, e))?;
+
+        // Create backup of existing file before overwriting
+        if path.exists() {
+            let backup_path = path.with_extension("backup");
+            if let Err(e) = tokio::fs::copy(&path, &backup_path).await {
+                log::warn!("Failed to create backup at {:?}: {}", backup_path, e);
+            } else {
+                log::debug!("Created backup at {:?}", backup_path);
+            }
+        }
+
+        // Atomic rename (ensures file is never partially written)
+        tokio::fs::rename(&temp_path, path).await
+            .map_err(|e| format!("Failed to rename {:?} to {:?}: {}", temp_path, path, e))?;
+
+        log::debug!("State persistence complete");
+        Ok(())
+    }
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -905,6 +1011,7 @@ impl AnkaiosServer {
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::vec;
+    use tempfile::TempDir;
 
     use super::{
         AnkaiosServer, FromServerSender, create_from_server_channel, create_to_server_channel,
@@ -919,20 +1026,20 @@ mod tests {
 
     use ankaios_api::ank_base::{
         AgentAttributesSpec, AgentMapSpec, AgentStatusSpec, CompleteState, CompleteStateRequest,
-        CompleteStateResponse, CompleteStateSpec, CpuUsageSpec, DeletedWorkload, Error,
-        ExecutionStateEnumSpec, ExecutionStateSpec, FreeMemorySpec, LogEntriesResponse, LogEntry,
-        LogsCancelAccepted, LogsRequest, LogsRequestAccepted, LogsStopResponse,
+        CompleteStateResponse, CompleteStateSpec, ConfigMapSpec, CpuUsageSpec, DeletedWorkload,
+        Error, ExecutionStateEnumSpec, ExecutionStateSpec, FreeMemorySpec, LogEntriesResponse,
+        LogEntry, LogsCancelAccepted, LogsRequest, LogsRequestAccepted, LogsStopResponse,
         Pending as PendingSubstate, Response, ResponseContent, State, StateSpec, TagsSpec,
         UpdateStateSuccess, Workload, WorkloadInstanceName, WorkloadInstanceNameSpec, WorkloadMap,
-        WorkloadMapSpec, WorkloadStateSpec, WorkloadStatesMapSpec,
+        WorkloadMapSpec, WorkloadSpec, WorkloadStateSpec, WorkloadStatesMapSpec,
     };
     use ankaios_api::test_utils::fixtures::{AGENT_NAMES, REQUEST_ID};
     use ankaios_api::test_utils::{
-        fixtures, generate_test_agent_map, generate_test_agent_tags, generate_test_config_map,
-        generate_test_workload_instance_name_with_params, generate_test_workload_named,
-        generate_test_workload_named_with_params, generate_test_workload_state,
-        generate_test_workload_state_with_agent, generate_test_workload_states_map_with_data,
-        generate_test_workload_with_params,
+        fixtures, generate_test_agent_map, generate_test_agent_tags, generate_test_config_item,
+        generate_test_config_map, generate_test_workload_instance_name_with_params,
+        generate_test_workload_named, generate_test_workload_named_with_params,
+        generate_test_workload_state, generate_test_workload_state_with_agent,
+        generate_test_workload_states_map_with_data, generate_test_workload_with_params,
     };
     use common::commands::{AgentLoadStatus, ServerHello, UpdateWorkload, UpdateWorkloadState};
     use common::from_server_interface::FromServer;
@@ -969,7 +1076,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mut mock_server_state = MockServerState::new();
 
         mock_server_state
@@ -1009,7 +1116,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let result = server.start(Some(startup_state)).await;
         assert_eq!(
             result,
@@ -1056,7 +1163,7 @@ mod tests {
 
         let update_mask = vec!["desiredState.workloads".to_string()];
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mut mock_server_state = MockServerState::new();
         let mut seq = mockall::Sequence::new();
         let new_desired_state = new_state.desired_state.clone();
@@ -1204,7 +1311,7 @@ mod tests {
         let added_workloads = vec![workload.clone()];
         let deleted_workloads = vec![];
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mut mock_server_state = MockServerState::new();
         mock_server_state
             .expect_update()
@@ -1258,7 +1365,7 @@ mod tests {
         let (to_agents, mut comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
 
         let w1 = generate_test_workload_named_with_params(
             fixtures::WORKLOAD_NAMES[0],
@@ -1448,7 +1555,7 @@ mod tests {
             "desiredState.workloads.{}",
             fixtures::WORKLOAD_NAMES[0]
         )];
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mut mock_server_state = MockServerState::new();
         let updated_desired_state = update_state.desired_state.clone();
         mock_server_state
@@ -1553,7 +1660,7 @@ mod tests {
             "desiredState.workloads.{}",
             fixtures::WORKLOAD_NAMES[0]
         )];
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mut mock_server_state = MockServerState::new();
         let updated_desired_state = update_state.desired_state.clone();
         mock_server_state
@@ -1645,7 +1752,7 @@ mod tests {
             "desiredState.workloads.{}",
             fixtures::WORKLOAD_NAMES[0]
         )];
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mut mock_server_state = MockServerState::new();
         let updated_desired_state = update_state.desired_state.clone();
         mock_server_state
@@ -1706,7 +1813,7 @@ mod tests {
         let (to_agents, mut comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mut mock_server_state = MockServerState::new();
 
         mock_server_state
@@ -1807,7 +1914,7 @@ mod tests {
         let (to_agents, mut comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mut mock_server_state = MockServerState::new();
 
         mock_server_state
@@ -1901,7 +2008,7 @@ mod tests {
             ..Default::default()
         };
         let request_id = format!("{}@my_request_id", fixtures::AGENT_NAMES[0]);
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mut mock_server_state = MockServerState::new();
         mock_server_state
             .expect_get_complete_state_by_field_mask()
@@ -1964,7 +2071,7 @@ mod tests {
         let (to_agents, mut comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mut mock_server_state = MockServerState::new();
         mock_server_state
             .expect_get_complete_state_by_field_mask()
@@ -2033,7 +2140,7 @@ mod tests {
         let (to_agents, mut comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         server
             .log_campaign_store
             .expect_remove_agent_log_campaign_entry()
@@ -2114,7 +2221,7 @@ mod tests {
         let (to_agents, mut comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         server
             .log_campaign_store
             .expect_remove_agent_log_campaign_entry()
@@ -2188,7 +2295,7 @@ mod tests {
                 fixtures::AGENT_NAMES[0],
             )
             .into();
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         server
             .log_campaign_store
             .expect_remove_agent_log_campaign_entry()
@@ -2299,7 +2406,7 @@ mod tests {
             dependencies: HashMap::new(),
         }];
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mut mock_server_state = MockServerState::new();
         let mut seq = mockall::Sequence::new();
         mock_server_state
@@ -2441,7 +2548,7 @@ mod tests {
         let (to_agents, _comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mock_server_state = MockServerState::new();
         server.server_state = mock_server_state;
 
@@ -2465,7 +2572,7 @@ mod tests {
         let (to_agents, mut comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mock_server_state = MockServerState::new();
         server.server_state = mock_server_state;
 
@@ -2525,7 +2632,7 @@ mod tests {
         };
 
         let update_mask = vec![format!("desiredState")];
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
 
         let mut mock_server_state = MockServerState::new();
         let new_desired_state = update_state.desired_state.clone();
@@ -2588,7 +2695,7 @@ mod tests {
         };
 
         let update_mask = vec![format!("desiredState")];
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
 
         let mut mock_server_state = MockServerState::new();
         let new_desired_state = update_state_ankaios_no_version.desired_state.clone();
@@ -2642,7 +2749,7 @@ mod tests {
         let (to_agents, _comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
 
         let mut mock_server_state = MockServerState::new();
 
@@ -2702,7 +2809,7 @@ mod tests {
             deleted_workload_with_agent.clone(),
         ];
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mut mock_server_state = MockServerState::new();
         mock_server_state
             .expect_generate_new_state()
@@ -2798,7 +2905,7 @@ mod tests {
 
         let deleted_workloads = vec![deleted_workload_with_agent.clone()];
 
-        let mut server: AnkaiosServer = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server: AnkaiosServer = AnkaiosServer::new(server_receiver, to_agents, None);
         let mut mock_server_state = MockServerState::new();
         mock_server_state
             .expect_generate_new_state()
@@ -2891,7 +2998,7 @@ mod tests {
         let (to_agents, _comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         server
             .agent_map
             .agents
@@ -2927,7 +3034,7 @@ mod tests {
         let (to_agents, _comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         server
             .server_state
             .expect_get_workloads_for_agent()
@@ -2976,7 +3083,7 @@ mod tests {
         let (to_agents, _comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         server
             .log_campaign_store
             .expect_remove_agent_log_campaign_entry()
@@ -3027,7 +3134,7 @@ mod tests {
         let (to_agents, mut comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
 
         let workload = generate_test_workload_named();
 
@@ -3121,7 +3228,7 @@ mod tests {
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
         let request_id = fixtures::REQUEST_ID.to_string();
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         server
             .log_campaign_store
             .expect_remove_logs_request_id()
@@ -3161,7 +3268,7 @@ mod tests {
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
         let request_id = fixtures::REQUEST_ID.to_string();
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let server_task = tokio::spawn(async move { server.start(None).await });
 
         let workload_instance_name = WorkloadInstanceName {
@@ -3204,7 +3311,7 @@ mod tests {
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
         let cli_request_id = format!("{CLI_CONNECTION_NAME}@cli-request-id-1");
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         server
             .log_campaign_store
             .expect_remove_cli_log_campaign_entry()
@@ -3247,7 +3354,7 @@ mod tests {
         let current_complete_state = CompleteState::default();
 
         let request_id = format!("{}@my_request_id", fixtures::AGENT_NAMES[0]);
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         server
             .server_state
             .expect_get_complete_state_by_field_mask()
@@ -3315,7 +3422,7 @@ mod tests {
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
         let request_id = format!("{}@my_request_id", fixtures::AGENT_NAMES[0]);
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
 
         server
             .event_handler
@@ -3359,7 +3466,7 @@ mod tests {
         let (to_agents, _comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
 
         server.server_state.expect_cleanup_state().return_const(());
 
@@ -3434,7 +3541,7 @@ mod tests {
         let (to_agents, _comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         server
             .log_campaign_store
             .expect_remove_agent_log_campaign_entry()
@@ -3570,7 +3677,7 @@ mod tests {
             "desiredState.workloads.{}",
             fixtures::WORKLOAD_NAMES[0]
         )];
-        let mut server = AnkaiosServer::new(server_receiver, to_agents.clone());
+        let mut server = AnkaiosServer::new(server_receiver, to_agents.clone(), None);
 
         server
             .workload_states_map
@@ -3727,7 +3834,7 @@ mod tests {
             .retain(|key, _| key == "config_2");
 
         let update_mask = vec!["desiredState.configs".to_owned()];
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
 
         let updated_desired_state = update_state.desired_state.clone();
 
@@ -3819,7 +3926,7 @@ mod tests {
         let (to_agents, _comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
 
         server.server_state.expect_cleanup_state().return_const(());
 
@@ -3920,7 +4027,7 @@ mod tests {
         let (to_agents, _comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         server
             .agent_map
             .agents
@@ -3998,7 +4105,7 @@ mod tests {
         let (to_agents, _comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         server
             .log_campaign_store
             .expect_remove_cli_log_campaign_entry()
@@ -4036,7 +4143,7 @@ mod tests {
         let (to_agents, _comm_middle_ware_receiver) =
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
 
         server.server_state.expect_cleanup_state().return_const(());
 
@@ -4133,7 +4240,7 @@ mod tests {
             "agents.new_agent".to_string(),
         ];
 
-        let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        let mut server = AnkaiosServer::new(server_receiver, to_agents, None);
         let mut mock_server_state = MockServerState::new();
 
         let agents_clone = update_state.agents.clone();
@@ -4294,5 +4401,322 @@ mod tests {
 
         server_task.abort();
         assert!(comm_middle_ware_receiver.try_recv().is_err());
+    }
+
+    // [utest->swdd~server-extracts-persistent-workloads~1]
+    #[test]
+    fn utest_extract_persistent_workloads_all_persistent() {
+        let state = StateSpec {
+            api_version: "v0.1".to_string(),
+            workloads: WorkloadMapSpec {
+                workloads: HashMap::from([
+                    (
+                        "nginx".to_string(),
+                        WorkloadSpec {
+                            persist: true,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "apache".to_string(),
+                        WorkloadSpec {
+                            persist: true,
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            },
+            configs: ConfigMapSpec {
+                configs: HashMap::new(),
+            },
+        };
+
+        let result = AnkaiosServer::extract_persistent_workloads(&state);
+
+        assert_eq!(result.workloads.workloads.len(), 2);
+        assert!(result.workloads.workloads.contains_key("nginx"));
+        assert!(result.workloads.workloads.contains_key("apache"));
+    }
+
+    #[test]
+    fn utest_extract_persistent_workloads_none_persistent() {
+        let state = StateSpec {
+            api_version: "v0.1".to_string(),
+            workloads: WorkloadMapSpec {
+                workloads: HashMap::from([
+                    (
+                        "temp1".to_string(),
+                        WorkloadSpec {
+                            persist: false,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "temp2".to_string(),
+                        WorkloadSpec {
+                            persist: false,
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            },
+            configs: ConfigMapSpec {
+                configs: HashMap::new(),
+            },
+        };
+
+        let result = AnkaiosServer::extract_persistent_workloads(&state);
+
+        assert_eq!(result.workloads.workloads.len(), 0);
+    }
+
+    #[test]
+    fn utest_extract_persistent_workloads_mixed() {
+        let state = StateSpec {
+            api_version: "v0.1".to_string(),
+            workloads: WorkloadMapSpec {
+                workloads: HashMap::from([
+                    (
+                        "nginx".to_string(),
+                        WorkloadSpec {
+                            persist: true,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "debug".to_string(),
+                        WorkloadSpec {
+                            persist: false,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "apache".to_string(),
+                        WorkloadSpec {
+                            persist: true,
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            },
+            configs: ConfigMapSpec {
+                configs: HashMap::new(),
+            },
+        };
+
+        let result = AnkaiosServer::extract_persistent_workloads(&state);
+
+        assert_eq!(result.workloads.workloads.len(), 2);
+        assert!(result.workloads.workloads.contains_key("nginx"));
+        assert!(result.workloads.workloads.contains_key("apache"));
+        assert!(!result.workloads.workloads.contains_key("debug"));
+    }
+
+    #[test]
+    fn utest_extract_persistent_workloads_preserves_configs() {
+        let state = StateSpec {
+            api_version: "v0.1".to_string(),
+            workloads: WorkloadMapSpec {
+                workloads: HashMap::new(),
+            },
+            configs: ConfigMapSpec {
+                configs: HashMap::from([
+                    (
+                        "config1".to_string(),
+                        generate_test_config_item("value1".to_string()),
+                    ),
+                    (
+                        "config2".to_string(),
+                        generate_test_config_item("value2".to_string()),
+                    ),
+                ]),
+            },
+        };
+
+        let result = AnkaiosServer::extract_persistent_workloads(&state);
+
+        assert_eq!(result.configs.configs.len(), 2);
+        assert!(result.configs.configs.contains_key("config1"));
+        assert!(result.configs.configs.contains_key("config2"));
+    }
+
+    #[test]
+    fn utest_extract_persistent_workloads_preserves_api_version() {
+        let state = StateSpec {
+            api_version: "v0.2".to_string(),
+            workloads: WorkloadMapSpec {
+                workloads: HashMap::from([(
+                    "nginx".to_string(),
+                    WorkloadSpec {
+                        persist: true,
+                        ..Default::default()
+                    },
+                )]),
+            },
+            configs: ConfigMapSpec {
+                configs: HashMap::new(),
+            },
+        };
+
+        let result = AnkaiosServer::extract_persistent_workloads(&state);
+
+        assert_eq!(result.api_version, "v0.2");
+    }
+
+    // [utest->swdd~server-persists-state-atomically~1]
+    #[tokio::test]
+    async fn utest_persist_state_creates_file() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let temp_dir = TempDir::new().unwrap();
+        let persistence_path = temp_dir.path().join("runtime_state.yaml");
+
+        let (_to_server, to_server_receiver) = create_to_server_channel(common::CHANNEL_CAPACITY);
+        let (from_server_sender, _from_server_receiver) =
+            create_from_server_channel(common::CHANNEL_CAPACITY);
+
+        let server = AnkaiosServer::new(
+            to_server_receiver,
+            from_server_sender,
+            Some(persistence_path.clone()),
+        );
+
+        let state = StateSpec {
+            api_version: "v0.1".to_string(),
+            workloads: WorkloadMapSpec {
+                workloads: HashMap::from([(
+                    "nginx".to_string(),
+                    WorkloadSpec {
+                        persist: true,
+                        ..Default::default()
+                    },
+                )]),
+            },
+            configs: ConfigMapSpec {
+                configs: HashMap::new(),
+            },
+        };
+
+        server.persist_state_to_file(&state).await.unwrap();
+
+        assert!(persistence_path.exists());
+
+        let content = tokio::fs::read_to_string(&persistence_path).await.unwrap();
+        assert!(content.contains("nginx"));
+    }
+
+    // [utest->swdd~server-persists-state-atomically~1]
+    #[tokio::test]
+    async fn utest_persist_state_deletes_when_empty() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let temp_dir = TempDir::new().unwrap();
+        let persistence_path = temp_dir.path().join("runtime_state.yaml");
+
+        // Create initial file
+        tokio::fs::write(&persistence_path, "test").await.unwrap();
+        assert!(persistence_path.exists());
+
+        let (_to_server, to_server_receiver) = create_to_server_channel(common::CHANNEL_CAPACITY);
+        let (from_server_sender, _from_server_receiver) =
+            create_from_server_channel(common::CHANNEL_CAPACITY);
+
+        let server = AnkaiosServer::new(
+            to_server_receiver,
+            from_server_sender,
+            Some(persistence_path.clone()),
+        );
+
+        let state = StateSpec {
+            api_version: "v0.1".to_string(),
+            workloads: WorkloadMapSpec {
+                workloads: HashMap::from([(
+                    "temp".to_string(),
+                    WorkloadSpec {
+                        persist: false,
+                        ..Default::default()
+                    },
+                )]),
+            },
+            configs: ConfigMapSpec {
+                configs: HashMap::new(),
+            },
+        };
+
+        server.persist_state_to_file(&state).await.unwrap();
+
+        assert!(!persistence_path.exists());
+    }
+
+    // [utest->swdd~server-persists-state-atomically~1]
+    #[tokio::test]
+    async fn utest_persist_state_creates_backup() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let temp_dir = TempDir::new().unwrap();
+        let persistence_path = temp_dir.path().join("runtime_state.yaml");
+        let backup_path = temp_dir.path().join("runtime_state.backup");
+
+        // Create initial file
+        tokio::fs::write(&persistence_path, "old content").await.unwrap();
+
+        let (_to_server, to_server_receiver) = create_to_server_channel(common::CHANNEL_CAPACITY);
+        let (from_server_sender, _from_server_receiver) =
+            create_from_server_channel(common::CHANNEL_CAPACITY);
+
+        let server = AnkaiosServer::new(
+            to_server_receiver,
+            from_server_sender,
+            Some(persistence_path.clone()),
+        );
+
+        let state = StateSpec {
+            api_version: "v0.1".to_string(),
+            workloads: WorkloadMapSpec {
+                workloads: HashMap::from([(
+                    "nginx".to_string(),
+                    WorkloadSpec {
+                        persist: true,
+                        ..Default::default()
+                    },
+                )]),
+            },
+            configs: ConfigMapSpec {
+                configs: HashMap::new(),
+            },
+        };
+
+        server.persist_state_to_file(&state).await.unwrap();
+
+        assert!(backup_path.exists());
+        let backup_content = tokio::fs::read_to_string(&backup_path).await.unwrap();
+        assert_eq!(backup_content, "old content");
+    }
+
+    // [utest->swdd~server-persists-state-atomically~1]
+    #[tokio::test]
+    async fn utest_persist_state_no_config_no_panic() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let (_to_server, to_server_receiver) = create_to_server_channel(common::CHANNEL_CAPACITY);
+        let (from_server_sender, _from_server_receiver) =
+            create_from_server_channel(common::CHANNEL_CAPACITY);
+
+        let server = AnkaiosServer::new(to_server_receiver, from_server_sender, None);
+
+        let state = StateSpec {
+            api_version: "v0.1".to_string(),
+            workloads: WorkloadMapSpec {
+                workloads: HashMap::from([(
+                    "nginx".to_string(),
+                    WorkloadSpec {
+                        persist: true,
+                        ..Default::default()
+                    },
+                )]),
+            },
+            configs: ConfigMapSpec {
+                configs: HashMap::new(),
+            },
+        };
+
+        // Should not panic, just skip persistence
+        server.persist_state_to_file(&state).await.unwrap();
     }
 }

@@ -154,6 +154,7 @@ fn setup_spec_workload(builder: Builder) -> Builder {
         .field_attribute("Workload.controlInterfaceAccess", "#[spec_default]")
         .field_attribute("Workload.configs", "#[spec_default]")
         .field_attribute("Workload.files", "#[spec_default]")
+        .field_attribute("Workload.persist", "#[spec_default]")
 
         .field_attribute("Workload.dependencies", "#[spec_field_attr(#[serde(flatten)])]")
         .field_attribute("Workload.tags", "#[spec_field_attr(#[serde(flatten)])]")
@@ -162,6 +163,7 @@ fn setup_spec_workload(builder: Builder) -> Builder {
 
         .field_attribute("Workload.restartPolicy", "#[spec_field_attr(#[serde(default)])]")
         .field_attribute("Workload.controlInterfaceAccess", "#[spec_field_attr(#[serde(default)])]")
+        .field_attribute("Workload.persist", r#"#[spec_field_attr(#[serde(default, skip_serializing_if = "is_false")])]"#)
 
         .message_attribute(
             "Dependencies",

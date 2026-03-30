@@ -714,6 +714,7 @@ mod tests {
                     control_interface_access: None,
                     configs: None,
                     files: None,
+                    persist: None,
                 },
             ),
             (
@@ -728,6 +729,7 @@ mod tests {
                     control_interface_access: None,
                     configs: None,
                     files: None,
+                    persist: None,
                 },
             ),
             (

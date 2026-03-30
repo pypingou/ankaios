@@ -136,6 +136,10 @@ fn annotate_workload(builder: Builder) -> Builder {
             "#[serde(skip_serializing_if = \"Option::is_none\")]",
         )
         .field_attribute(
+            "Workload.persist",
+            "#[serde(skip_serializing_if = \"Option::is_none\")]",
+        )
+        .field_attribute(
             "Tags.tags",
             "#[serde(skip_serializing_if = \"::std::collections::HashMap::is_empty\")]",
         )

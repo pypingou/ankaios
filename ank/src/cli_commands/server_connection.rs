@@ -1984,6 +1984,7 @@ mod tests {
                         .into(),
                     }),
                     files: Some(generate_test_files().into()),
+                    persist: None,
                 },
             )])),
         }));
@@ -2008,6 +2009,7 @@ mod tests {
                         .into(),
                     }),
                     files: Some(generate_test_files().into()),
+                    persist: None,
                 },
             )])),
         }));
@@ -2054,6 +2056,7 @@ mod tests {
                             configs: HashMap::new(),
                         }),
                         files: Some(generate_test_files().into()),
+                        persist: None,
                     },
                 )])),
             }));

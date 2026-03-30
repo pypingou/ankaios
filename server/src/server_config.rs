@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use toml::from_str;
 
 pub const DEFAULT_SERVER_CONFIG_FILE_PATH: [&str; 1] = ["/etc/ankaios/ank-server.conf"];
+pub const DEFAULT_RUNTIME_STATE_FILE: &str = "/var/lib/ankaios/runtime_state.yaml";
 
 pub fn get_default_address() -> SocketAddr {
     DEFAULT_SOCKET_ADDRESS.parse().unwrap_or_unreachable()
@@ -50,6 +51,7 @@ where
 pub struct ServerConfig {
     pub version: String,
     pub startup_manifest: Option<String>,
+    pub state_persistence_file: Option<String>,
     #[serde(deserialize_with = "convert_to_socket_address")]
     #[serde(default = "get_default_address")]
     pub address: SocketAddr,
@@ -68,6 +70,7 @@ impl Default for ServerConfig {
         ServerConfig {
             version: CONFIG_VERSION.to_string(),
             startup_manifest: None,
+            state_persistence_file: None,
             address: get_default_address(),
             insecure: false,
             ca_pem: None,
@@ -450,6 +453,24 @@ mod tests {
         assert_eq!(
             server_config.startup_manifest,
             Some("/workspaces/ankaios/server/resources/startConfig.yaml".to_string())
+        );
+    }
+
+    #[test]
+    fn utest_server_config_with_persistence_file() {
+        let server_config_content = r#"
+        version = 'v1'
+        state_persistence_file = '/var/lib/ankaios/runtime_state.yaml'
+    "#;
+
+        let mut tmp_config_file = NamedTempFile::new().unwrap();
+        write!(tmp_config_file, "{server_config_content}").unwrap();
+
+        let server_config = ServerConfig::from_file(PathBuf::from(tmp_config_file.path())).unwrap();
+
+        assert_eq!(
+            server_config.state_persistence_file,
+            Some("/var/lib/ankaios/runtime_state.yaml".to_string())
         );
     }
 }

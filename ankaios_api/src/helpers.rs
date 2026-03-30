@@ -168,6 +168,10 @@ pub fn should_skip_control_interface_serialization(
     }
 }
 
+pub fn is_false(value: &bool) -> bool {
+    !value
+}
+
 //////////////////////////////////////////////////////////////////////////////
 //                 ########  #######    #########  #########                //
 //                    ##     ##        ##             ##                    //
