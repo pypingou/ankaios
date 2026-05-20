@@ -15,6 +15,7 @@
 mod ankaios_server;
 mod cli;
 mod server_config;
+mod signature_validator;
 
 use ankaios_api::ank_base::{CompleteStateSpec, StateSpec, validate_tags};
 use ankaios_server::{AnkaiosServer, create_from_server_channel, create_to_server_channel};
@@ -25,11 +26,20 @@ use common::std_extensions::GracefulExitResult;
 
 use grpc::{security::TLSConfig, server::GRPCCommunicationsServer};
 use server_config::{DEFAULT_SERVER_CONFIG_FILE_PATH, ServerConfig};
+use signature_validator::{SignaturePolicy, SignatureValidator};
 
 use std::fs;
 
 #[cfg(test)]
 pub mod test_helper;
+
+/// Extract the first YAML document from a potentially multi-document YAML file
+/// (strips signature block if present)
+fn extract_first_yaml_document(yaml: &str) -> String {
+    // Split on YAML document separator
+    let parts: Vec<&str> = yaml.split("\n---\n").collect();
+    parts[0].to_string()
+}
 
 // [impl->swdd~server-validates-startup-manifest-tags-format~1]
 fn validate_tags_format_in_manifest(data: &str) -> Result<(), String> {
@@ -79,17 +89,81 @@ async fn main() {
             .unwrap_or("[no manifest file provided]".to_string()),
     );
 
+    // Initialize signature validator early if enabled (needed for startup manifest verification)
+    let mut signature_validator = if server_config.signature_verification.enabled {
+        let policy = SignaturePolicy {
+            require_signature: server_config.signature_verification.require_signature,
+            require_counter: server_config.signature_verification.require_counter,
+            allowed_key_ids: server_config.signature_verification.allowed_key_ids.clone(),
+            min_counter: server_config.signature_verification.min_counter,
+        };
+
+        match SignatureValidator::from_keys_directory(
+            &server_config.signature_verification.keys_directory,
+            policy,
+        ) {
+            Ok(validator) => {
+                log::info!("✅ Signature verification enabled");
+                Some(validator)
+            }
+            Err(e) => {
+                log::error!("Failed to initialize signature validator: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        log::info!("Signature verification disabled");
+        None
+    };
+
     let startup_state = match &server_config.startup_manifest {
         Some(config_path) => {
             let data =
                 fs::read_to_string(config_path).unwrap_or_exit("Could not read the startup config");
 
-            validate_tags_format_in_manifest(&data)
+            // Extract unsigned content for parsing (strip signature block if present)
+            let unsigned_content = if let Some(ref mut validator) = signature_validator {
+                match validator.verify_signed_yaml(&data, "startup-manifest") {
+                    Ok(verified_doc) => {
+                        if let Some(counter) = verified_doc.counter {
+                            log::info!(
+                                "✅ Startup manifest signature verified: key_id={}, counter={}",
+                                verified_doc.key_id,
+                                counter
+                            );
+                        } else {
+                            log::info!(
+                                "✅ Startup manifest signature verified: key_id={}, counter=(none)",
+                                verified_doc.key_id
+                            );
+                        }
+                        // Use the unsigned content from verification (signature block stripped)
+                        verified_doc.unsigned_content
+                    }
+                    Err(e) => {
+                        // Check if signature is required by policy
+                        if server_config.signature_verification.require_signature {
+                            log::error!("❌ Startup manifest signature verification failed: {}", e);
+                            std::process::exit(1);
+                        } else {
+                            log::warn!("⚠️  Startup manifest signature verification failed: {}", e);
+                            log::warn!("⚠️  Accepting unsigned manifest (policy allows)");
+                            // Extract first YAML document (strip signature block if present)
+                            extract_first_yaml_document(&data)
+                        }
+                    }
+                }
+            } else {
+                // No validator - extract first YAML document (strip signature block if present)
+                extract_first_yaml_document(&data)
+            };
+
+            validate_tags_format_in_manifest(&unsigned_content)
                 .unwrap_or_exit("Invalid tags format in startup manifest");
 
             // [impl->swdd~server-state-in-memory~1]
             // [impl->swdd~server-loads-startup-state-file~3]
-            let state: StateSpec = serde_yaml::from_str(&data)
+            let state: StateSpec = serde_yaml::from_str(&unsigned_content)
                 .unwrap_or_exit("Parsing start config failed with error");
             log::trace!(
                 "The state is initialized with the following workloads: {:?}",
@@ -131,7 +205,12 @@ async fn main() {
         // [impl->swdd~server-fails-on-missing-file-paths-and-insecure-cli-arguments~1]
         tls_config.unwrap_or_exit("Missing certificate files"),
     );
-    let mut server = AnkaiosServer::new(server_receiver, to_agents.clone());
+
+    let mut server = AnkaiosServer::new_with_validator(
+        server_receiver,
+        to_agents.clone(),
+        signature_validator,
+    );
 
     tokio::select! {
         // [impl->swdd~server-default-communication-grpc~1]

@@ -144,6 +144,7 @@ message CompleteStateRequest {
 message UpdateStateRequest {
     CompleteState newState = 1; // The new state of the Ankaios system.
     repeated string updateMask = 2; // A list of symbolic field paths within the state message structure, e.g., 'desiredState.workloads.nginx' to specify what to be updated.
+    optional string signed_yaml = 3; // Raw signed YAML content for signature verification. When present, the server verifies the signature before applying the state update.
 }
 
 /*
@@ -162,6 +163,7 @@ message UpdateStateSuccess {
 message CompleteStateResponse {
     CompleteState completeState = 1; // The complete state of the Ankaios system.
     AlteredFields alteredFields = 2; // The fields that were added, updated, or removed in the state compared to the previous state.
+    string signed_yaml = 3; // The signed YAML content (with signature block) or serialized unsigned YAML. Always populated for signature preservation through events.
 }
 
 /*

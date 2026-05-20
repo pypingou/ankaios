@@ -250,6 +250,7 @@ impl CliCommands {
         &mut self,
         new_state: CompleteState,
         update_mask: Vec<String>,
+        signed_yaml: Option<String>,
     ) -> Result<(), CliError> {
         /* to keep track of deleted not initially started workloads in the wait mode
         the current workloads before the update must be stored in an ordered map. Affects only user output.
@@ -259,7 +260,7 @@ impl CliCommands {
 
         let update_state_success = self
             .server_connection
-            .update_state(new_state, update_mask)
+            .update_state(new_state, update_mask, signed_yaml)
             .await?;
 
         output_debug!("Got update success: {:?}", update_state_success);

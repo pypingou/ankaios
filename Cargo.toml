@@ -10,5 +10,6 @@ members = [
     "spec_macros",
     "grpc",
     "ank",
+    "tools/ank-sign",
     "tests/resources/control_interface_tester",
 ]

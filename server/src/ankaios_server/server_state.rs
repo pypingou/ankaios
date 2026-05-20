@@ -38,6 +38,8 @@ pub struct StateGenerationResult {
     pub old_desired_state: StateSpec,
     pub new_desired_state: StateSpec,
     pub new_agent_map: AgentMapSpec,
+    pub signed_yaml: String,  // Signed YAML (with signature block) or serialized unsigned YAML
+    pub update_mask: Vec<String>,  // Update mask from the request (for signature-only updates)
 }
 
 fn extract_added_and_deleted_workloads(
@@ -118,6 +120,7 @@ pub struct ServerState {
     rendered_workloads: RenderedWorkloads,
     delete_graph: DeleteGraph,
     config_renderer: ConfigRenderer,
+    last_signed_yaml: Option<String>,  // Store last applied signed YAML for GetStateRequest
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -166,6 +169,18 @@ fn include_both_state_and_substate_filters(filters: &mut Vec<String>) {
 impl ServerState {
     const API_VERSION_FILTER_MASK: &'static str = "desiredState.apiVersion";
     const DESIRED_STATE_FIELD_MASK_PART: &'static str = "desiredState";
+
+    // Used in ankaios_server.rs but not detected by dead code analysis
+    #[allow(dead_code)]
+    pub fn get_desired_state(&self) -> &StateSpec {
+        &self.state.desired_state
+    }
+
+    // Used in ankaios_server.rs line 407 but not detected by dead code analysis
+    #[allow(dead_code)]
+    pub fn get_last_signed_yaml(&self) -> Option<String> {
+        self.last_signed_yaml.clone()
+    }
 
     // [impl->swdd~server-provides-interface-get-complete-state~2]
     // [impl->swdd~server-filters-get-complete-state-result~2]
@@ -317,9 +332,10 @@ impl ServerState {
     }
 
     pub fn generate_new_state(
-        &self,
+        &mut self,
         updated_state: CompleteState,
         update_mask: Vec<String>,
+        signed_yaml: Option<String>,  // Signed YAML from UpdateStateRequest, or None to serialize
     ) -> Result<StateGenerationResult, UpdateStateError> {
         // [impl->swdd~update-desired-state-empty-update-mask~1]
         if update_mask.is_empty() {
@@ -329,10 +345,25 @@ impl ServerState {
                         "Could not parse into CompleteState: '{err}'"
                     ))
                 })?;
+
+            // If signed_yaml was provided, use it; otherwise serialize the state
+            let yaml_content = if let Some(signed) = signed_yaml {
+                signed
+            } else {
+                // Unsigned update - serialize state to YAML for persistence
+                serde_yaml::to_string(&new_complete_state.desired_state)
+                    .map_err(|e| UpdateStateError::ResultInvalid(format!("Failed to serialize state: {}", e)))?
+            };
+
+            // Store signed_yaml for GetStateRequest responses
+            self.last_signed_yaml = Some(yaml_content.clone());
+
             return Ok(StateGenerationResult {
                 old_desired_state: self.state.desired_state.clone(),
                 new_desired_state: new_complete_state.desired_state,
                 new_agent_map: new_complete_state.agents,
+                signed_yaml: yaml_content,
+                update_mask: vec![],  // Empty update mask
             });
         }
 
@@ -346,14 +377,33 @@ impl ServerState {
 
         let mut new_state = old_state.clone();
 
-        for field in update_mask {
+        for field in &update_mask {
             let field: Path = field.into();
             if let Some(field_from_update) = state_from_update.get(&field) {
                 if new_state.set(&field, field_from_update.to_owned()).is_err() {
                     return Err(UpdateStateError::FieldNotFound(field.into()));
                 }
-            } else if new_state.remove(&field).is_err() {
-                return Err(UpdateStateError::FieldNotFound(field.into()));
+            } else {
+                // Field not in update - this is a deletion request
+                log::info!("🗑️  Deleting field from state: {}", field);
+                match new_state.remove(&field) {
+                    Ok(removed_value) => {
+                        log::info!("✅ Successfully removed field: {}", field);
+                        if let Some(value) = removed_value {
+                            log::debug!("Removed value type: {:?}", value);
+                        }
+                        // Extra verification for workload deletions
+                        let field_str = field.to_string();
+                        if field_str.starts_with("desiredState.workloads.") {
+                            let workload_name = field_str.strip_prefix("desiredState.workloads.").unwrap_or("");
+                            log::info!("🗑️  Workload '{}' has been removed from new_state", workload_name);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("❌ Failed to remove field '{}': {}", field, e);
+                        return Err(UpdateStateError::FieldNotFound(field.into()));
+                    }
+                }
             }
         }
 
@@ -364,10 +414,24 @@ impl ServerState {
                 ))
             })?;
 
+        // If signed_yaml was provided, use it; otherwise serialize the state
+        let yaml_content = if let Some(signed) = signed_yaml {
+            signed
+        } else {
+            // Unsigned update - serialize state to YAML for persistence
+            serde_yaml::to_string(&new_complete_state.desired_state)
+                .map_err(|e| UpdateStateError::ResultInvalid(format!("Failed to serialize state: {}", e)))?
+        };
+
+        // Store signed_yaml for GetStateRequest responses
+        self.last_signed_yaml = Some(yaml_content.clone());
+
         Ok(StateGenerationResult {
             old_desired_state: self.state.desired_state.clone(),
             new_desired_state: new_complete_state.desired_state,
             new_agent_map: new_complete_state.agents,
+            signed_yaml: yaml_content,
+            update_mask: update_mask.clone(),  // Store update mask for signature-only updates
         })
     }
 
@@ -892,6 +956,7 @@ mod tests {
             rendered_workloads: generate_rendered_workloads_from_state(&old_state.desired_state),
             delete_graph: delete_graph_mock,
             config_renderer: mock_config_renderer,
+            last_signed_yaml: None,
         };
 
         let result = server_state.update(desired_state_spec);
@@ -914,12 +979,12 @@ mod tests {
         let update_state: CompleteState = generate_test_update_state().into();
         let update_mask = vec![];
 
-        let server_state = ServerState {
+        let mut server_state = ServerState {
             state: old_state.clone(),
             ..Default::default()
         };
         let state_generation_result = server_state
-            .generate_new_state(update_state.clone(), update_mask)
+            .generate_new_state(update_state.clone(), update_mask, None)
             .unwrap();
 
         let expected_desired_state: StateSpec =
@@ -956,13 +1021,13 @@ mod tests {
             .workloads
             .insert(fixtures::WORKLOAD_NAMES[0].to_owned(), new_workload.clone());
 
-        let server_state = ServerState {
+        let mut server_state = ServerState {
             state: old_state.clone(),
             ..Default::default()
         };
 
         let state_generation_result = server_state
-            .generate_new_state(update_state.into(), update_mask)
+            .generate_new_state(update_state.into(), update_mask, None)
             .unwrap();
 
         assert_eq!(
@@ -997,13 +1062,13 @@ mod tests {
             .workloads
             .insert(fixtures::WORKLOAD_NAMES[3].into(), new_workload.clone());
 
-        let server_state = ServerState {
+        let mut server_state = ServerState {
             state: old_state.clone(),
             ..Default::default()
         };
 
         let state_generation_result = server_state
-            .generate_new_state(update_state.into(), update_mask)
+            .generate_new_state(update_state.into(), update_mask, None)
             .unwrap();
 
         assert_eq!(
@@ -1022,7 +1087,7 @@ mod tests {
 
         let update_mask = vec!["desiredState".to_string()];
 
-        let server_state = ServerState {
+        let mut server_state = ServerState {
             state: old_state.clone(),
             ..Default::default()
         };
@@ -1030,7 +1095,7 @@ mod tests {
         let expected = state_with_updated_config.clone();
 
         let state_generation_result = server_state
-            .generate_new_state(state_with_updated_config.into(), update_mask)
+            .generate_new_state(state_with_updated_config.into(), update_mask, None)
             .unwrap();
 
         assert_eq!(
@@ -1058,13 +1123,13 @@ mod tests {
             .remove(fixtures::WORKLOAD_NAMES[1])
             .unwrap();
 
-        let server_state = ServerState {
+        let mut server_state = ServerState {
             state: old_state.clone(),
             ..Default::default()
         };
 
         let state_generation_result = server_state
-            .generate_new_state(update_state.into(), update_mask)
+            .generate_new_state(update_state.into(), update_mask, None)
             .unwrap();
 
         assert_eq!(
@@ -1083,13 +1148,13 @@ mod tests {
 
         let expected = &old_state;
 
-        let server_state = ServerState {
+        let mut server_state = ServerState {
             state: old_state.clone(),
             ..Default::default()
         };
 
         let state_generation_result = server_state
-            .generate_new_state(update_state.into(), update_mask)
+            .generate_new_state(update_state.into(), update_mask, None)
             .unwrap();
 
         assert_eq!(
@@ -1106,11 +1171,11 @@ mod tests {
         let field_mask = "desiredState.workloads.non.existing";
         let update_mask = vec![field_mask.into()];
 
-        let server_state = ServerState {
+        let mut server_state = ServerState {
             state: old_state.clone(),
             ..Default::default()
         };
-        let result = server_state.generate_new_state(update_state.into(), update_mask);
+        let result = server_state.generate_new_state(update_state.into(), update_mask, None);
         assert!(result.is_err());
         assert_eq!(
             UpdateStateError::FieldNotFound(field_mask.into()),
@@ -1126,11 +1191,11 @@ mod tests {
         let update_state = generate_test_update_state();
         let update_mask = vec!["".into()];
 
-        let server_state = ServerState {
+        let mut server_state = ServerState {
             state: old_state.clone(),
             ..Default::default()
         };
-        let result = server_state.generate_new_state(update_state.into(), update_mask);
+        let result = server_state.generate_new_state(update_state.into(), update_mask, None);
         assert!(result.is_err());
         assert_eq!(
             UpdateStateError::FieldNotFound("".into()),
@@ -1143,13 +1208,13 @@ mod tests {
     #[test]
     fn utest_server_state_generate_new_state_no_changes_on_equal_states() {
         let _guard = crate::test_helper::MOCKALL_CONTEXT_SYNC.get_lock();
-        let server_state = ServerState::default(); // empty old state
+        let mut server_state = ServerState::default(); // empty old state
 
         let expected_complete_state = CompleteStateSpec::default();
         let new_complete_state: CompleteState = expected_complete_state.clone().into();
 
         let state_generation_result = server_state
-            .generate_new_state(new_complete_state, vec![])
+            .generate_new_state(new_complete_state, vec![], None)
             .unwrap();
         assert_eq!(
             state_generation_result.new_desired_state,
@@ -1249,6 +1314,7 @@ mod tests {
             rendered_workloads: generate_rendered_workloads_from_state(&old_state.desired_state),
             delete_graph: delete_graph_mock,
             config_renderer: mock_config_renderer,
+            last_signed_yaml: None,
         };
 
         let result = server_state.update(updated_state.desired_state);
@@ -1563,6 +1629,7 @@ mod tests {
             state: current_complete_state,
             delete_graph: delete_graph_mock,
             config_renderer: mock_config_renderer,
+            last_signed_yaml: None,
         };
 
         let added_deleted_workloads = server_state

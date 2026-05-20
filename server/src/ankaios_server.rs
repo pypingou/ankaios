@@ -29,6 +29,8 @@ use ankaios_api::ank_base::{
 };
 use common::state_manipulation::Path;
 
+use crate::signature_validator::SignatureValidator;
+
 use server_state::AddedDeletedWorkloads;
 
 use common::std_extensions::{IllegalStateResult, UnreachableResult};
@@ -76,10 +78,21 @@ pub struct AnkaiosServer {
     agent_map: AgentMapSpec,
     log_campaign_store: LogCampaignStore,
     event_handler: EventHandler,
+    signature_validator: Option<SignatureValidator>,
 }
 
 impl AnkaiosServer {
+    // Used in production but not in tests
+    #[allow(dead_code)]
     pub fn new(receiver: ToServerReceiver, to_agents: FromServerSender) -> Self {
+        Self::new_with_validator(receiver, to_agents, None)
+    }
+
+    pub fn new_with_validator(
+        receiver: ToServerReceiver,
+        to_agents: FromServerSender,
+        signature_validator: Option<SignatureValidator>,
+    ) -> Self {
         AnkaiosServer {
             receiver,
             to_agents,
@@ -88,6 +101,7 @@ impl AnkaiosServer {
             agent_map: AgentMapSpec::default(),
             log_campaign_store: LogCampaignStore::default(),
             event_handler: EventHandler::default(),
+            signature_validator,
         }
     }
 
@@ -196,6 +210,13 @@ impl AnkaiosServer {
                             ..Default::default()
                         };
 
+                        // Serialize current state (no signed_yaml for agent connection events)
+                        let yaml_content = serde_yaml::to_string(self.server_state.get_desired_state())
+                            .unwrap_or_else(|e| {
+                                log::error!("Failed to serialize state: {}", e);
+                                String::from("# Serialization failed")
+                            });
+
                         let state_comparator = StateComparator::new(old_state, new_state);
                         let state_difference_tree = state_comparator.state_differences();
                         self.event_handler
@@ -205,6 +226,7 @@ impl AnkaiosServer {
                                 &self.agent_map,
                                 state_difference_tree,
                                 &self.to_agents,
+                                &yaml_content,  // Serialized unsigned YAML for agent event
                             )
                             .await;
                     }
@@ -245,6 +267,13 @@ impl AnkaiosServer {
                             ..Default::default()
                         };
 
+                        // Serialize current state (no signed_yaml for agent status events)
+                        let yaml_content = serde_yaml::to_string(self.server_state.get_desired_state())
+                            .unwrap_or_else(|e| {
+                                log::error!("Failed to serialize state: {}", e);
+                                String::from("# Serialization failed")
+                            });
+
                         let state_comparator = StateComparator::new(old_state, new_state);
 
                         let state_difference_tree = state_comparator.state_differences();
@@ -256,6 +285,7 @@ impl AnkaiosServer {
                                 &self.agent_map,
                                 state_difference_tree,
                                 &self.to_agents,
+                                &yaml_content,  // Serialized unsigned YAML
                             )
                             .await;
                     }
@@ -295,6 +325,13 @@ impl AnkaiosServer {
                             ..Default::default()
                         };
 
+                        // Serialize current state (no signed_yaml for agent gone events)
+                        let yaml_content = serde_yaml::to_string(self.server_state.get_desired_state())
+                            .unwrap_or_else(|e| {
+                                log::error!("Failed to serialize state: {}", e);
+                                String::from("# Serialization failed")
+                            });
+
                         let state_comparator = StateComparator::new(old_state, new_state);
 
                         let state_difference_tree = state_comparator.state_differences();
@@ -306,6 +343,7 @@ impl AnkaiosServer {
                                 &self.agent_map,
                                 state_difference_tree,
                                 &self.to_agents,
+                                &yaml_content,  // Serialized unsigned YAML
                             )
                             .await;
 
@@ -367,8 +405,19 @@ impl AnkaiosServer {
                                 &self.agent_map,
                             ) {
                                 Ok(complete_state) => {
+                                    // Use stored signed_yaml from last UpdateStateRequest if available
+                                    let yaml_content = self.server_state.get_last_signed_yaml()
+                                        .unwrap_or_else(|| {
+                                            // Fall back to serializing if no signed_yaml stored
+                                            serde_yaml::to_string(self.server_state.get_desired_state())
+                                                .unwrap_or_else(|e| {
+                                                    log::error!("Failed to serialize state: {}", e);
+                                                    String::from("# Serialization failed")
+                                                })
+                                        });
+
                                     self.to_agents
-                                        .complete_state(request_id.clone(), complete_state, None)
+                                        .complete_state(request_id.clone(), complete_state, None, yaml_content)
                                         .await
                                         .unwrap_or_illegal_state();
 
@@ -387,7 +436,12 @@ impl AnkaiosServer {
                                 Err(error) => {
                                     log::error!("Failed to get complete state: '{error}'");
                                     self.to_agents
-                                        .complete_state(request_id, CompleteState::default(), None)
+                                        .complete_state(
+                                            request_id,
+                                            CompleteState::default(),
+                                            None,
+                                            String::new()  // Empty YAML for error case
+                                        )
                                         .await
                                         .unwrap_or_illegal_state();
                                 }
@@ -396,6 +450,70 @@ impl AnkaiosServer {
 
                         // [impl->swdd~server-provides-update-desired-state-interface~1]
                         RequestContent::UpdateStateRequest(update_state_request) => {
+                            // Verify signature if present and validator is enabled
+                            if let Some(ref signed_yaml) = update_state_request.signed_yaml {
+                                if let Some(ref mut validator) = self.signature_validator {
+                                    // Derive source identifier from request context
+                                    let source = format!("request:{}", request_id);
+
+                                    match validator.verify_signed_yaml(signed_yaml, &source) {
+                                        Ok(verified_doc) => {
+                                            if let Some(counter) = verified_doc.counter {
+                                                log::info!(
+                                                    "✅ UpdateStateRequest signature verified: key_id={}, counter={}, source={}",
+                                                    verified_doc.key_id,
+                                                    counter,
+                                                    source
+                                                );
+                                            } else {
+                                                log::info!(
+                                                    "✅ UpdateStateRequest signature verified: key_id={}, counter=(none), source={}",
+                                                    verified_doc.key_id,
+                                                    source
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::error!(
+                                                "❌ UpdateStateRequest signature verification failed from {}: {}",
+                                                source,
+                                                e
+                                            );
+                                            self.to_agents
+                                                .error(
+                                                    request_id,
+                                                    format!("Signature verification failed: {}", e),
+                                                )
+                                                .await
+                                                .unwrap_or_illegal_state();
+                                            continue;
+                                        }
+                                    }
+                                }
+                            } else {
+                                // No signature provided
+                                if let Some(ref validator) = self.signature_validator {
+                                    if validator.policy().require_signature {
+                                        log::error!(
+                                            "❌ Signature required but UpdateStateRequest from {} is unsigned",
+                                            request_id
+                                        );
+                                        self.to_agents
+                                            .error(
+                                                request_id,
+                                                "Signature required by policy".to_string(),
+                                            )
+                                            .await
+                                            .unwrap_or_illegal_state();
+                                        continue;
+                                    }
+                                    log::warn!(
+                                        "⚠️  Accepting unsigned UpdateStateRequest from {} (policy allows)",
+                                        request_id
+                                    );
+                                }
+                            }
+
                             let Some(new_state) = update_state_request.new_state else {
                                 log::warn!(
                                     "The UpdateStateRequest does not contain a new state -> ignoring the request"
@@ -411,6 +529,7 @@ impl AnkaiosServer {
                                 continue;
                             };
                             let update_mask = update_state_request.update_mask;
+                            let signed_yaml = update_state_request.signed_yaml;  // Preserve for events
 
                             log::debug!(
                                 "Received UpdateState. State '{new_state:?}', update mask '{update_mask:?}'"
@@ -421,7 +540,7 @@ impl AnkaiosServer {
 
                             let state_generation_result = match self
                                 .server_state
-                                .generate_new_state(new_state, update_mask)
+                                .generate_new_state(new_state, update_mask, signed_yaml)
                             {
                                 Ok(state_generation_result) => state_generation_result,
                                 Err(error_msg) => {
@@ -484,21 +603,40 @@ impl AnkaiosServer {
                                         // state changes must be calculated after every update since only config item can be changed as well
                                         let old_state = CompleteStateSpec {
                                             desired_state: state_generation_result
-                                                .old_desired_state,
+                                                .old_desired_state.clone(),
                                             ..Default::default()
                                         };
 
                                         let new_state = CompleteStateSpec {
                                             desired_state: state_generation_result
-                                                .new_desired_state,
+                                                .new_desired_state.clone(),
                                             ..Default::default()
                                         };
 
                                         let state_comparator =
                                             StateComparator::new(old_state, new_state);
 
-                                        let state_difference_tree =
+                                        let mut state_difference_tree =
                                             state_comparator.state_differences();
+
+                                        // If state is identical but signed_yaml is present (signature-only update),
+                                        // create artificial update events for the fields in update_mask
+                                        // so persistence plugins can update their stored signatures
+                                        if state_difference_tree.is_empty() && !state_generation_result.signed_yaml.is_empty() && !state_generation_result.update_mask.is_empty() {
+                                            log::debug!("State identical but signed manifest present - sending update events for signature refresh: {:?}", state_generation_result.update_mask);
+
+                                            // Create updated_tree from update_mask paths
+                                            use common::state_manipulation::{Object, Path};
+                                            let mut updated_obj = Object::default();
+                                            for field_path in &state_generation_result.update_mask {
+                                                let path: Path = field_path.into();
+                                                // Set a marker value (Null) at each path to indicate it was updated
+                                                // Null is treated as a leaf node by collect_all_leaf_paths_iterative
+                                                let _ = updated_obj.set(&path, serde_yaml::Value::Null);
+                                            }
+
+                                            state_difference_tree.updated_tree.full_difference_tree = updated_obj;
+                                        }
 
                                         if !state_difference_tree.is_empty() {
                                             self.event_handler
@@ -508,6 +646,7 @@ impl AnkaiosServer {
                                                     &self.agent_map,
                                                     state_difference_tree,
                                                     &self.to_agents,
+                                                    &state_generation_result.signed_yaml,  // Pass signed YAML to events
                                                 )
                                                 .await;
                                         }
@@ -618,6 +757,13 @@ impl AnkaiosServer {
                             ..Default::default()
                         };
 
+                        // Serialize current state (no signed_yaml for workload state events)
+                        let yaml_content = serde_yaml::to_string(self.server_state.get_desired_state())
+                            .unwrap_or_else(|e| {
+                                log::error!("Failed to serialize state: {}", e);
+                                String::from("# Serialization failed")
+                            });
+
                         let state_comparator = StateComparator::new(old_state, new_state);
 
                         let state_difference_tree = state_comparator.state_differences();
@@ -629,6 +775,7 @@ impl AnkaiosServer {
                                 &self.agent_map,
                                 state_difference_tree,
                                 &self.to_agents,
+                                &yaml_content,  // Serialized unsigned YAML
                             )
                             .await;
 
@@ -711,12 +858,17 @@ impl AnkaiosServer {
     ) {
         let added_workloads = added_deleted_workloads.added_workloads;
         let deleted_workloads = added_deleted_workloads.deleted_workloads;
-        log::info!(
-            "The update has {} new or updated workloads, {} workloads to delete",
-            added_workloads.len(),
-            deleted_workloads.len()
-        );
+        let deleted_workloads_names: Vec<String> = deleted_workloads
+            .iter()
+            .map(|x| x.instance_name.to_string())
+            .collect();
 
+        log::info!(
+            "The update has {} new or updated workloads, {} workloads to delete: {:?}",
+            added_workloads.len(),
+            deleted_workloads.len(),
+            deleted_workloads_names
+        );
         let old_state = if self.event_handler.has_subscribers() {
             CompleteStateSpec {
                 desired_state: state_generation_result.old_desired_state,
@@ -731,10 +883,6 @@ impl AnkaiosServer {
         self.workload_states_map.initial_state(&added_workloads);
 
         let added_workloads_names = added_workloads
-            .iter()
-            .map(|x| x.instance_name.to_string())
-            .collect();
-        let deleted_workloads_names = deleted_workloads
             .iter()
             .map(|x| x.instance_name.to_string())
             .collect();
@@ -768,6 +916,7 @@ impl AnkaiosServer {
                         &self.agent_map,
                         state_difference_tree,
                         &self.to_agents,
+                        &state_generation_result.signed_yaml,  // Use signed YAML from UpdateStateRequest
                     )
                     .await;
             }
@@ -1064,9 +1213,10 @@ mod tests {
             .expect_generate_new_state()
             .once()
             .in_sequence(&mut seq)
-            .returning(move |_, _| {
+            .returning(move |_, _, signed_yaml| {
                 Ok(StateGenerationResult {
                     new_desired_state: new_desired_state.clone(),
+                    signed_yaml: signed_yaml.unwrap_or_else(|| String::new()),
                     ..Default::default()
                 })
             });
@@ -1089,9 +1239,10 @@ mod tests {
             .expect_generate_new_state()
             .once()
             .in_sequence(&mut seq)
-            .returning(move |_, _| {
+            .returning(move |_, _, signed_yaml| {
                 Ok(StateGenerationResult {
                     new_desired_state: fixed_desired_state.clone(),
+                    signed_yaml: signed_yaml.unwrap_or_else(|| String::new()),
                     ..Default::default()
                 })
             });
@@ -1122,7 +1273,8 @@ mod tests {
                 .update_state(
                     fixtures::REQUEST_ID.to_string(),
                     new_state.clone().into(),
-                    update_mask.clone()
+                    update_mask.clone(),
+                    None,
                 )
                 .await
                 .is_ok()
@@ -1142,7 +1294,8 @@ mod tests {
                 .update_state(
                     fixtures::REQUEST_ID.to_string(),
                     fixed_state.clone().into(),
-                    update_mask
+                    update_mask,
+                    None,
                 )
                 .await
                 .is_ok()
@@ -1454,9 +1607,10 @@ mod tests {
         mock_server_state
             .expect_generate_new_state()
             .once()
-            .returning(move |_, _| {
+            .returning(move |_, _, signed_yaml| {
                 Ok(StateGenerationResult {
                     new_desired_state: updated_desired_state.clone(),
+                    signed_yaml: signed_yaml.unwrap_or_else(|| String::new()),
                     ..Default::default()
                 })
             });
@@ -1484,6 +1638,7 @@ mod tests {
                 fixtures::REQUEST_ID.to_string(),
                 update_state.into(),
                 update_mask,
+                None,
             )
             .await;
         assert!(update_state_result.is_ok());
@@ -1559,9 +1714,10 @@ mod tests {
         mock_server_state
             .expect_generate_new_state()
             .once()
-            .returning(move |_, _| {
+            .returning(move |_, _, signed_yaml| {
                 Ok(StateGenerationResult {
                     new_desired_state: updated_desired_state.clone(),
+                    signed_yaml: signed_yaml.unwrap_or_else(|| String::new()),
                     ..Default::default()
                 })
             });
@@ -1586,6 +1742,7 @@ mod tests {
                 fixtures::REQUEST_ID.to_string(),
                 update_state.into(),
                 update_mask,
+                None,
             )
             .await;
         assert!(update_state_result.is_ok());
@@ -1651,9 +1808,10 @@ mod tests {
         mock_server_state
             .expect_generate_new_state()
             .once()
-            .returning(move |_, _| {
+            .returning(move |_, _, signed_yaml| {
                 Ok(StateGenerationResult {
                     new_desired_state: updated_desired_state.clone(),
+                    signed_yaml: signed_yaml.unwrap_or_else(|| String::new()),
                     ..Default::default()
                 })
             });
@@ -1673,6 +1831,7 @@ mod tests {
                 fixtures::REQUEST_ID.to_string(),
                 update_state.into(),
                 update_mask,
+                None,
             )
             .await;
         assert!(update_state_result.is_ok());
@@ -1904,6 +2063,9 @@ mod tests {
         let mut server = AnkaiosServer::new(server_receiver, to_agents);
         let mut mock_server_state = MockServerState::new();
         mock_server_state
+            .expect_get_desired_state()
+            .return_const(StateSpec::default());
+        mock_server_state
             .expect_get_complete_state_by_field_mask()
             .with(
                 mockall::predicate::function(|request_complete_state| {
@@ -1918,6 +2080,9 @@ mod tests {
             )
             .once()
             .return_const(Ok(current_complete_state.clone()));
+        mock_server_state
+            .expect_get_last_signed_yaml()
+            .return_const(None);
         server.server_state = mock_server_state;
         let server_task = tokio::spawn(async move { server.start(None).await });
 
@@ -1936,18 +2101,23 @@ mod tests {
 
         let from_server_command = comm_middle_ware_receiver.recv().await.unwrap();
 
-        assert_eq!(
-            from_server_command,
-            common::from_server_interface::FromServer::Response(Response {
-                request_id,
-                response_content: Some(ResponseContent::CompleteStateResponse(Box::new(
-                    CompleteStateResponse {
-                        complete_state: Some(current_complete_state),
-                        ..Default::default()
+        // Extract the response to check signed_yaml separately (since it's serialized)
+        match from_server_command {
+            common::from_server_interface::FromServer::Response(response) => {
+                assert_eq!(response.request_id, request_id);
+                match response.response_content {
+                    Some(ResponseContent::CompleteStateResponse(state_response)) => {
+                        assert_eq!(state_response.complete_state, Some(current_complete_state));
+                        assert_eq!(state_response.altered_fields, None);
+                        // signed_yaml should contain serialized state (non-empty)
+                        assert!(!state_response.signed_yaml.is_empty(), "signed_yaml should be populated with serialized state");
+                        assert!(state_response.signed_yaml.contains("apiVersion"), "signed_yaml should contain serialized YAML");
                     }
-                )))
-            })
-        );
+                    _ => panic!("Expected CompleteStateResponse"),
+                }
+            }
+            _ => panic!("Expected Response"),
+        }
 
         server_task.abort();
         assert!(comm_middle_ware_receiver.try_recv().is_err());
@@ -2321,9 +2491,10 @@ mod tests {
             .expect_generate_new_state()
             .once()
             .in_sequence(&mut seq)
-            .returning(move |_, _| {
+            .returning(move |_, _, signed_yaml| {
                 Ok(StateGenerationResult {
                     new_desired_state: updated_desired_state.clone(),
+                    signed_yaml: signed_yaml.unwrap_or_else(|| String::new()),
                     ..Default::default()
                 })
             });
@@ -2365,6 +2536,7 @@ mod tests {
                 fixtures::REQUEST_ID.to_string(),
                 update_state.into(),
                 update_mask.clone(),
+                None,
             )
             .await;
         assert!(update_state_result.is_ok());
@@ -2532,9 +2704,10 @@ mod tests {
         mock_server_state
             .expect_generate_new_state()
             .once()
-            .return_once(move |_, _| {
+            .return_once(move |_, _, signed_yaml| {
                 Ok(StateGenerationResult {
                     new_desired_state,
+                    signed_yaml: signed_yaml.unwrap_or_else(|| String::new()),
                     ..Default::default()
                 })
             });
@@ -2548,6 +2721,7 @@ mod tests {
                 fixtures::REQUEST_ID.to_string(),
                 update_state.into(),
                 update_mask,
+                None,
             )
             .await;
         assert!(update_state_result.is_ok());
@@ -2595,9 +2769,10 @@ mod tests {
         mock_server_state
             .expect_generate_new_state()
             .once()
-            .return_once(move |_, _| {
+            .return_once(move |_, _, signed_yaml| {
                 Ok(StateGenerationResult {
                     new_desired_state,
+                    signed_yaml: signed_yaml.unwrap_or_else(|| String::new()),
                     ..Default::default()
                 })
             });
@@ -2611,6 +2786,7 @@ mod tests {
                 fixtures::REQUEST_ID.to_string(),
                 update_state_ankaios_no_version.into(),
                 update_mask,
+                None,
             )
             .await;
         assert!(update_state_result.is_ok());
@@ -2707,7 +2883,7 @@ mod tests {
         mock_server_state
             .expect_generate_new_state()
             .once()
-            .returning(move |_, _| Ok(StateGenerationResult::default()));
+            .returning(move |_, _, _| Ok(StateGenerationResult::default()));
         mock_server_state
             .expect_update()
             .once()
@@ -2733,6 +2909,7 @@ mod tests {
                 fixtures::REQUEST_ID.to_string(),
                 update_state,
                 update_mask.clone(),
+                None,
             )
             .await;
         assert!(update_state_result.is_ok());
@@ -2803,7 +2980,7 @@ mod tests {
         mock_server_state
             .expect_generate_new_state()
             .once()
-            .returning(move |_, _| Ok(StateGenerationResult::default()));
+            .returning(move |_, _, _| Ok(StateGenerationResult::default()));
 
         mock_server_state
             .expect_update()
@@ -2843,6 +3020,7 @@ mod tests {
                 fixtures::REQUEST_ID.to_string(),
                 update_state,
                 update_mask.clone(),
+                None,
             )
             .await;
         assert!(update_state_result.is_ok());
@@ -3045,9 +3223,10 @@ mod tests {
         mock_server_state
             .expect_generate_new_state()
             .once()
-            .returning(move |_, _| {
+            .returning(move |_, _, signed_yaml| {
                 Ok(StateGenerationResult {
                     new_desired_state: updated_desired_state.clone(),
+                    signed_yaml: signed_yaml.unwrap_or_else(|| String::new()),
                     ..Default::default()
                 })
             });
@@ -3088,6 +3267,7 @@ mod tests {
                         "desiredState.workloads.{}",
                         fixtures::WORKLOAD_NAMES[0]
                     )],
+                    None,
                 )
                 .await
                 .is_ok()
@@ -3250,9 +3430,17 @@ mod tests {
         let mut server = AnkaiosServer::new(server_receiver, to_agents);
         server
             .server_state
+            .expect_get_desired_state()
+            .return_const(StateSpec::default());
+        server
+            .server_state
             .expect_get_complete_state_by_field_mask()
             .once()
             .return_const(Ok(current_complete_state.clone()));
+        server
+            .server_state
+            .expect_get_last_signed_yaml()
+            .return_const(None);
 
         server
             .event_handler
@@ -3288,20 +3476,23 @@ mod tests {
 
         let from_server_command = comm_middle_ware_receiver.recv().await.unwrap();
 
-        assert_eq!(
-            from_server_command,
-            common::from_server_interface::FromServer::Response(ankaios_api::ank_base::Response {
-                request_id,
-                response_content: Some(
-                    ankaios_api::ank_base::response::ResponseContent::CompleteStateResponse(
-                        Box::new(CompleteStateResponse {
-                            complete_state: Some(current_complete_state),
-                            ..Default::default()
-                        })
-                    )
-                )
-            })
-        );
+        // Extract the response to check signed_yaml separately (since it's serialized)
+        match from_server_command {
+            common::from_server_interface::FromServer::Response(response) => {
+                assert_eq!(response.request_id, request_id);
+                match response.response_content {
+                    Some(ankaios_api::ank_base::response::ResponseContent::CompleteStateResponse(state_response)) => {
+                        assert_eq!(state_response.complete_state, Some(current_complete_state));
+                        assert_eq!(state_response.altered_fields, None);
+                        // signed_yaml should contain serialized state (non-empty)
+                        assert!(!state_response.signed_yaml.is_empty(), "signed_yaml should be populated with serialized state");
+                        assert!(state_response.signed_yaml.contains("apiVersion"), "signed_yaml should contain serialized YAML");
+                    }
+                    _ => panic!("Expected CompleteStateResponse"),
+                }
+            }
+            _ => panic!("Expected Response"),
+        }
 
         assert!(comm_middle_ware_receiver.try_recv().is_err());
     }
@@ -3361,6 +3552,11 @@ mod tests {
 
         let mut server = AnkaiosServer::new(server_receiver, to_agents);
 
+        server
+            .server_state
+            .expect_get_desired_state()
+            .return_const(StateSpec::default());
+
         server.server_state.expect_cleanup_state().return_const(());
 
         server
@@ -3409,6 +3605,7 @@ mod tests {
                 mockall::predicate::always(),
                 mockall::predicate::eq(state_diference_tree),
                 mockall::predicate::always(),
+                mockall::predicate::always(), // signed_yaml
             )
             .once()
             .return_const(());
@@ -3435,6 +3632,11 @@ mod tests {
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
         let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        server
+            .server_state
+            .expect_get_desired_state()
+            .return_const(StateSpec::default());
+
         server
             .log_campaign_store
             .expect_remove_agent_log_campaign_entry()
@@ -3494,6 +3696,7 @@ mod tests {
                 mockall::predicate::always(),
                 mockall::predicate::eq(state_diference_tree),
                 mockall::predicate::always(),
+                mockall::predicate::always(), // signed_yaml
             )
             .once()
             .return_const(());
@@ -3650,7 +3853,7 @@ mod tests {
             .server_state
             .expect_generate_new_state()
             .once()
-            .return_once(move |_, _| Ok(state_generation_result));
+            .return_once(move |_, _, _| Ok(state_generation_result));
         server
             .server_state
             .expect_update()
@@ -3688,6 +3891,7 @@ mod tests {
                 mockall::predicate::function(move |event_sender_channel: &FromServerSender| {
                     event_sender_channel.same_channel(&to_agents)
                 }),
+                mockall::predicate::always(), // signed_yaml
             )
             .once()
             .return_const(());
@@ -3698,6 +3902,7 @@ mod tests {
                 fixtures::REQUEST_ID.to_string(),
                 update_state.into(),
                 update_mask,
+                None,
             )
             .await;
         assert!(update_state_result.is_ok());
@@ -3762,7 +3967,7 @@ mod tests {
             .server_state
             .expect_generate_new_state()
             .once()
-            .return_once(move |_, _| Ok(state_generation_result));
+            .return_once(move |_, _, _| Ok(state_generation_result));
         server
             .server_state
             .expect_update()
@@ -3789,6 +3994,7 @@ mod tests {
                 mockall::predicate::always(),
                 mockall::predicate::eq(expected_state_difference_tree),
                 mockall::predicate::always(),
+                mockall::predicate::always(), // signed_yaml
             )
             .once()
             .return_const(());
@@ -3799,6 +4005,7 @@ mod tests {
                 fixtures::REQUEST_ID.to_string(),
                 update_state.into(),
                 update_mask,
+                None,
             )
             .await;
         assert!(update_state_result.is_ok());
@@ -3820,6 +4027,11 @@ mod tests {
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
         let mut server = AnkaiosServer::new(server_receiver, to_agents);
+
+        server
+            .server_state
+            .expect_get_desired_state()
+            .return_const(StateSpec::default());
 
         server.server_state.expect_cleanup_state().return_const(());
 
@@ -3895,6 +4107,7 @@ mod tests {
                 mockall::predicate::always(),
                 mockall::predicate::eq(expected_state_difference_tree),
                 mockall::predicate::always(),
+                mockall::predicate::always(), // signed_yaml
             )
             .once()
             .return_const(());
@@ -3921,6 +4134,11 @@ mod tests {
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
         let mut server = AnkaiosServer::new(server_receiver, to_agents);
+        server
+            .server_state
+            .expect_get_desired_state()
+            .return_const(StateSpec::default());
+
         server
             .agent_map
             .agents
@@ -3973,6 +4191,7 @@ mod tests {
                 mockall::predicate::always(),
                 mockall::predicate::eq(expected_state_difference_tree),
                 mockall::predicate::always(),
+                mockall::predicate::always(), // signed_yaml
             )
             .once()
             .return_const(());
@@ -4037,6 +4256,11 @@ mod tests {
             create_from_server_channel(common::CHANNEL_CAPACITY);
 
         let mut server = AnkaiosServer::new(server_receiver, to_agents);
+
+        server
+            .server_state
+            .expect_get_desired_state()
+            .return_const(StateSpec::default());
 
         server.server_state.expect_cleanup_state().return_const(());
 
@@ -4136,6 +4360,10 @@ mod tests {
         let mut server = AnkaiosServer::new(server_receiver, to_agents);
         let mut mock_server_state = MockServerState::new();
 
+        mock_server_state
+            .expect_get_desired_state()
+            .return_const(StateSpec::default());
+
         let agents_clone = update_state.agents.clone();
         let update_state_clone: CompleteState = update_state.clone().into();
         mock_server_state
@@ -4143,11 +4371,13 @@ mod tests {
             .with(
                 mockall::predicate::eq(update_state_clone),
                 mockall::predicate::eq(update_mask.clone()),
+                mockall::predicate::always(), // signed_yaml parameter (accept any)
             )
-            .returning(move |_, _| {
+            .returning(move |_, _, signed_yaml| {
                 Ok(StateGenerationResult {
                     new_desired_state: Default::default(),
                     new_agent_map: agents_clone.clone(),
+                    signed_yaml: signed_yaml.unwrap_or_else(|| String::new()),
                     ..Default::default()
                 })
             });
@@ -4164,6 +4394,9 @@ mod tests {
                     ..Default::default()
                 })
             });
+        mock_server_state
+            .expect_get_last_signed_yaml()
+            .return_const(None);
         server.server_state = mock_server_state;
         server.agent_map.agents.insert(
             fixtures::AGENT_NAMES[0].to_string(),
@@ -4242,6 +4475,7 @@ mod tests {
                 fixtures::REQUEST_ID.to_string(),
                 update_state.into(),
                 update_mask,
+                None,
             )
             .await;
         assert!(update_state_result.is_ok());

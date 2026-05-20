@@ -36,6 +36,51 @@ pub fn get_default_address() -> SocketAddr {
     DEFAULT_SOCKET_ADDRESS.parse().unwrap_or_unreachable()
 }
 
+fn default_keys_directory() -> PathBuf {
+    PathBuf::from("/usr/share/ankaios/keys")
+}
+
+/// Configuration for Ed25519 signature verification
+#[derive(Debug, Deserialize, PartialEq, Clone)]
+pub struct SignatureVerificationConfig {
+    /// Enable signature verification module
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Directory containing public key PEM files (*.pub)
+    #[serde(default = "default_keys_directory")]
+    pub keys_directory: PathBuf,
+
+    /// Reject unsigned manifests when true
+    #[serde(default)]
+    pub require_signature: bool,
+
+    /// Require counter field in signatures (if false, counter is optional)
+    #[serde(default)]
+    pub require_counter: bool,
+
+    /// List of allowed key IDs (empty = accept any key_id)
+    #[serde(default)]
+    pub allowed_key_ids: Vec<String>,
+
+    /// Minimum counter value for rollback protection
+    #[serde(default)]
+    pub min_counter: u64,
+}
+
+impl Default for SignatureVerificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,              // Disabled by default (backward compatible)
+            keys_directory: default_keys_directory(),
+            require_signature: false,    // Allow unsigned when enabled
+            require_counter: false,      // Counter is optional by default
+            allowed_key_ids: Vec::new(), // Empty = accept any key_id
+            min_counter: 0,              // Start from 0
+        }
+    }
+}
+
 fn convert_to_socket_address<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
 where
     D: Deserializer<'de>,
@@ -61,6 +106,8 @@ pub struct ServerConfig {
     pub ca_pem_content: Option<String>,
     pub crt_pem_content: Option<String>,
     pub key_pem_content: Option<String>,
+    #[serde(default)]
+    pub signature_verification: SignatureVerificationConfig,
 }
 
 impl Default for ServerConfig {
@@ -76,6 +123,7 @@ impl Default for ServerConfig {
             ca_pem_content: None,
             crt_pem_content: None,
             key_pem_content: None,
+            signature_verification: SignatureVerificationConfig::default(),
         }
     }
 }

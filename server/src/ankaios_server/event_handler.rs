@@ -114,33 +114,43 @@ impl EventHandler {
         agent_map: &AgentMapSpec,
         field_difference_tree: StateDifferenceTree,
         from_server_channel: &FromServerSender,
+        signed_yaml: &str,  // Signed YAML (with signature) or serialized unsigned YAML
     ) {
-        let added_first_difference_tree = field_difference_tree
+        let added_first_difference_tree: serde_yaml::Mapping = field_difference_tree
             .added_tree
             .first_difference_tree
             .try_into()
             .unwrap_or_illegal_state();
-        let added_full_difference_tree = field_difference_tree
+        let added_full_difference_tree: serde_yaml::Mapping = field_difference_tree
             .added_tree
             .full_difference_tree
             .try_into()
             .unwrap_or_illegal_state();
-        let removed_first_difference_tree = field_difference_tree
+        let removed_first_difference_tree: serde_yaml::Mapping = field_difference_tree
             .removed_tree
             .first_difference_tree
             .try_into()
             .unwrap_or_illegal_state();
-        let removed_full_difference_tree = field_difference_tree
+        let removed_full_difference_tree: serde_yaml::Mapping = field_difference_tree
             .removed_tree
             .full_difference_tree
             .try_into()
             .unwrap_or_illegal_state();
 
-        let updated_full_difference_tree = field_difference_tree
+        let updated_full_difference_tree: serde_yaml::Mapping = field_difference_tree
             .updated_tree
             .full_difference_tree
             .try_into()
             .unwrap_or_illegal_state();
+
+        // Debug: Log what difference trees we have
+        log::debug!("🔍 Difference trees - added: {} items, removed: {} items, updated: {} items",
+            added_full_difference_tree.len(),
+            removed_full_difference_tree.len(),
+            updated_full_difference_tree.len());
+        if !removed_full_difference_tree.is_empty() {
+            log::debug!("🗑️  REMOVAL TREE: {:?}", removed_full_difference_tree);
+        }
 
         for (request_id, subscribed_field_masks) in &self.subscriber_store {
             // [impl->swdd~event-handler-creates-altered-fields-using-first-difference-tree~1]
@@ -171,6 +181,13 @@ impl EventHandler {
                 removed_fields: removed_altered_fields,
                 updated_fields: updated_altered_fields,
             };
+
+            log::debug!("🔔 Event for subscriber '{}': added={}, removed={}, updated={}",
+                request_id, altered_fields.added_fields.len(),
+                altered_fields.removed_fields.len(), altered_fields.updated_fields.len());
+            if !altered_fields.removed_fields.is_empty() {
+                log::debug!("🗑️  SERVER SENDING REMOVAL EVENT: removed_fields={:?}", altered_fields.removed_fields);
+            }
 
             let mut filter_masks = altered_fields.added_fields.clone();
             filter_masks.extend(altered_fields.removed_fields.clone());
@@ -203,6 +220,7 @@ impl EventHandler {
                         request_id,
                         complete_state_differences,
                         Some(altered_fields.into()),
+                        signed_yaml.to_string(),  // Include signed YAML in event
                     )
                     .await
                     .unwrap_or_illegal_state();
@@ -728,6 +746,7 @@ mod tests {
                 &agent_map,
                 state_difference_tree,
                 &to_agents,
+                "", // Empty signed_yaml for test
             )
             .await;
 
