@@ -18,6 +18,7 @@ PORT = int(os.environ.get('MQTT_BROKER_PORT', '1883'))
 VEHICLE_ID = os.environ.get('VIN')
 BASE_TOPIC = f"vehicle/{VEHICLE_ID}"
 
+
 # Create a new Ankaios object.
 # The connection to the control interface is automatically done at this step.
 # The Ankaios class supports context manager syntax:
@@ -32,22 +33,25 @@ with Ankaios() as ankaios:
     # Callback when a PUBLISH message is received from the MQTT server
     def on_message(client, userdata, msg):
         try:
-            logger.info(f"Received message on topic {msg.topic} with payload {msg.payload.decode()}")
+            payload = msg.payload.decode()
+            logger.info(f"Received message on topic {msg.topic} with payload {payload}")
             # Handle request for applying a manifest
             if msg.topic == f"{BASE_TOPIC}/manifest/apply/req":
-                manifest = Manifest.from_string(str(msg.payload.decode()))
+                # Manifest.from_string() now handles both signed and unsigned YAML
+                manifest = Manifest.from_string(payload)
                 ret = ankaios.apply_manifest(manifest)
                 if ret is not None:
                     client.publish(f"{BASE_TOPIC}/manifest/apply/resp", json.dumps(ret.to_dict()))
             # Handle request for deleting a manifest
             elif msg.topic == f"{BASE_TOPIC}/manifest/delete/req":
-                manifest = Manifest.from_string(str(msg.payload.decode()))
+                # Manifest.from_string() now handles both signed and unsigned YAML
+                manifest = Manifest.from_string(payload)
                 ret = ankaios.delete_manifest(manifest)
                 if ret is not None:
                     client.publish(f"{BASE_TOPIC}/manifest/delete/resp", json.dumps(ret.to_dict()))
             # Handle request for getting the state of Ankaios
             elif msg.topic == f"{BASE_TOPIC}/state/req":
-                state = ankaios.get_state(field_masks=json.loads(str(msg.payload.decode())))
+                state = ankaios.get_state(field_masks=json.loads(payload))
                 client.publish(f"{BASE_TOPIC}/state/resp", json.dumps(state.to_dict()))
         except Exception as e:
             logger.error(f"Error processing message: {e}")
