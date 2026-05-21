@@ -55,6 +55,7 @@ use runtime_connectors::{
     containerd::{self, ContainerdRuntime, ContainerdWorkloadId},
     podman::{self, PodmanRuntime, PodmanWorkloadId},
     podman_kube::{self, PodmanKubeRuntime, PodmanKubeWorkloadId},
+    systemd::{self, SystemdRuntime, SystemdWorkloadId},
 };
 
 use grpc::client::GRPCCommunicationsClient;
@@ -194,6 +195,14 @@ async fn main() {
                     runtime_facade_map,
                     ContainerdRuntime {},
                     ContainerdWorkloadId,
+                    run_directory.get_path()
+                );
+            }
+            systemd::NAME => {
+                register_runtime!(
+                    runtime_facade_map,
+                    SystemdRuntime {},
+                    SystemdWorkloadId,
                     run_directory.get_path()
                 );
             }
